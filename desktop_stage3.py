@@ -1051,6 +1051,7 @@ class Stage3Mixin:
         def show(data):
             self.new_sales_invoice(confirm=False)
             if data.get("invoice_date"): self.sales_date.set(data["invoice_date"])
+            if data.get("invoice_number"): self.sales_no.set(str(data["invoice_number"]).strip())
             if data.get("party_name"): self.sales_party.set(data["party_name"])
             if data.get("currency"): self.sales_currency.set(data["currency"])
             line=self.sales_items[0]

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from desktop_stage3 import Stage3Mixin
+from desktop_v22 import V22Mixin
 from chart_extra import EXPENSE_VAT, PURCHASE_VAT, SALES_VAT
 from pdf_import import _ocr_pdf_pages, _parse_invoice_text, read_invoice_pdf, read_invoice_pdf_pages, suggest_invoice_type
 
@@ -512,10 +513,51 @@ class OcrPageTests(unittest.TestCase):
             Stage3Mixin.choose_purchase_pdf(purchase)
             Stage3Mixin.choose_expense_pdf(expense)
         self.assertEqual(purchase_vars["type"].get(),"Purchases")
+        self.assertEqual(purchase_vars["number"].get(),"A-1")
         self.assertEqual(purchase.purchase_form["pdf_suggested_type"],"Assets")
         self.assertEqual(expense.expense_form["pdf_suggested_type"],"Assets")
         self.assertIn("Suggested Type: Assets",purchase.purchase_form["pdf_label"].config.call_args.kwargs["text"])
         self.assertIn("Suggested Type: Assets",expense.expense_form["pdf_label"].config.call_args.kwargs["text"])
+
+    def test_sales_pdf_previews_keep_the_read_invoice_number_after_date_refresh(self):
+        class Field:
+            def __init__(self, value="", on_set=None):
+                self.value, self.on_set = value, on_set
+            def get(self): return self.value
+            def set(self, value):
+                self.value = value
+                if self.on_set: self.on_set()
+
+        number = Field()
+        date = Field(on_set=lambda: number.set("AUTO-FROM-DATE"))
+        screen = types.SimpleNamespace(
+            sales_no=number, sales_date=date, sales_party=Field(), sales_currency=Field(),
+            sales_items=[{"_iid": "first"}], sales_sheet=Mock(),
+            new_sales_invoice=Mock(side_effect=lambda confirm=False: number.set("AUTO-NEW")),
+            recalculate_sales_item=Mock(), sales_row_values=Mock(return_value=("line",)),
+            update_sales_totals=Mock(),
+        )
+        data = {"invoice_number": "SUP-42", "invoice_date": "15-03-2026",
+                "party_name": "Supplier Co", "currency": "USD", "subtotal": 100, "notes": "Please check"}
+        with patch("desktop_v22.filedialog.askopenfilename", return_value="sales.pdf"), \
+             patch("pdf_import.read_invoice_pdf", return_value=data), \
+             patch("desktop_v22.messagebox.showinfo"):
+            V22Mixin.import_sales_pdf(screen)
+        self.assertEqual(number.get(), "SUP-42")
+
+        screen.run_ai_task = lambda _worker, show: show(data)
+        with patch("desktop_stage3.filedialog.askopenfilename", return_value="sales.pdf"), \
+             patch("desktop_stage3.messagebox.showinfo"):
+            Stage3Mixin.ai_read_sales_pdf(screen)
+        self.assertEqual(number.get(), "SUP-42")
+
+        # An unreadable number must not overwrite the generated draft number.
+        data["invoice_number"] = ""
+        with patch("desktop_v22.filedialog.askopenfilename", return_value="sales.pdf"), \
+             patch("pdf_import.read_invoice_pdf", return_value=data), \
+             patch("desktop_v22.messagebox.showinfo"):
+            V22Mixin.import_sales_pdf(screen)
+        self.assertEqual(number.get(), "AUTO-FROM-DATE")
 
 
 if __name__ == "__main__":

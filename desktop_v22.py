@@ -133,11 +133,12 @@ class V22Mixin:
         if not path: return
         data = read_invoice_pdf(path); self.new_sales_invoice(confirm=False)
         if data.get("invoice_date"): self.sales_date.set(data["invoice_date"])
+        if data.get("invoice_number"): self.sales_no.set(str(data["invoice_number"]).strip())
         if data.get("party_name"): self.sales_party.set(data["party_name"])
         if data.get("currency"): self.sales_currency.set(data["currency"])
         first = self.sales_items[0]; first.update(description=f"As per {Path(path).name}", quantity=1, unit_price=data.get("subtotal") or data.get("total") or 0)
         self.recalculate_sales_item(first); self.sales_sheet.item(first["_iid"], values=self.sales_row_values(first)); self.update_sales_totals()
-        messagebox.showinfo("Import PDF", f"{data.get('notes', '')}\nCheck the customer and the amount, then press Save.")
+        messagebox.showinfo("Import PDF", f"{data.get('notes', '')}\nCheck the invoice number, customer and amount, then press Save.")
 
     # ------------------------------------------------------------ F2: the list that fits the field you are in
     def setup_context_f2(self):
