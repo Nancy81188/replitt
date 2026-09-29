@@ -1,0 +1,50 @@
+name: Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download source
+        uses: actions/checkout@v5
+
+      # NOTE: we deliberately use the system Python (with the matching system
+      # Tk) instead of actions/setup-python. The app uses tkinter, and a
+      # setup-python interpreter can ship a Tk build that does not match the
+      # runner's, which breaks the GUI import during tests.
+      - name: Install system dependencies (Tk + headless X server)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-tk python3-venv xvfb
+
+      - name: Create virtual environment and install requirements
+        run: |
+          python3 -m venv --system-site-packages .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          # Same pinned versions as the Windows build (requirements.txt); PyInstaller is only needed there.
+          grep -iv '^pyinstaller' requirements.txt > ci-requirements.txt
+          python -m pip install -r ci-requirements.txt
+
+      - name: Prepare case-sensitive asset path
+        # Tests/code reference the assets under a lowercase "assets" folder,
+        # but the repository ships them as "Assets". On case-sensitive Linux
+        # filesystems we add a lowercase symlink so both spellings resolve.
+        run: ln -sf Assets assets
+
+      - name: Run all tests
+        run: |
+          . .venv/bin/activate
+          xvfb-run -a python -m unittest discover -v -p "test_*.py"

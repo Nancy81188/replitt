@@ -1,0 +1,1 @@
+GitHub OAuth access did not allow writing to .github/workflows. These two YAML files are copies of the project workflows. Move them into .github/workflows using an account with workflow-write permission to enable Windows builds and tests. The source code is not a verified Windows installer.
