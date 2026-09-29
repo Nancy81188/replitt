@@ -151,7 +151,7 @@ class InventoryMixin:
         tk.Label(bar, text="Number", bg=LIGHT).pack(side="left")
         tk.Entry(bar, textvariable=v["number"], width=16, state="readonly", readonlybackground="white", font=("Segoe UI", 10, "bold")).pack(side="left", padx=(4, 8))
         tk.Label(bar, text="Date", bg=LIGHT).pack(side="left"); self.date_entry(bar, v["date"], 11).pack(side="left", padx=(4, 8))
-        tk.Label(bar, text="Warehouse", bg=LIGHT).pack(side="left")
+        self.sd_warehouse_label = tk.Label(bar, text="Warehouse", bg=LIGHT); self.sd_warehouse_label.pack(side="left")
         self.sd_warehouse_box = ttk.Combobox(bar, textvariable=v["warehouse"], state="readonly", width=17); self.sd_warehouse_box.pack(side="left", padx=(4, 8))
         self.sd_to_label = tk.Label(bar, text="To", bg=LIGHT); self.sd_to_box = ttk.Combobox(bar, textvariable=v["to_warehouse"], state="readonly", width=17)
         tk.Label(bar, text="Find", bg=LIGHT).pack(side="right")
@@ -166,6 +166,7 @@ class InventoryMixin:
         tk.Label(bar2, text="Notes", bg=LIGHT).pack(side="left"); tk.Entry(bar2, textvariable=v["notes"], width=28).pack(side="left", padx=4)
         bottom = tk.Frame(page, bg=LIGHT); bottom.pack(side="bottom", fill="x", padx=8, pady=6)
         self.action_button(bottom, "New", self.new_stock_document).pack(side="left", padx=(0, 3))
+        self.action_button(bottom, "New Warehouse Transfer", self.new_warehouse_transfer).pack(side="left", padx=3)
         self.action_button(bottom, "Add Line", self.add_stock_line).pack(side="left", padx=3)
         tk.Button(bottom, text="Delete Line", command=self.delete_stock_line, bg=RED, fg="white", border=0, padx=12, pady=7).pack(side="left", padx=3)
         tk.Button(bottom, text="Save", command=self.save_stock_document, bg=GOLD, fg=NAVY, border=0, padx=18, pady=7, font=("Segoe UI", 9, "bold")).pack(side="left", padx=(12, 3))
@@ -196,8 +197,11 @@ class InventoryMixin:
 
     def stock_type_changed(self):
         transfer = self.sd_vars["type"].get() == "Transfer"
+        self.sd_warehouse_label.config(text="From" if transfer else "Warehouse")
         if transfer: self.sd_to_label.pack(side="left"); self.sd_to_box.pack(side="left", padx=(4, 8))
         else: self.sd_to_label.pack_forget(); self.sd_to_box.pack_forget()
+        self.sd_info.config(text=("Choose different From and To warehouses. Stock moves at its existing cost; the On Hand column is company-wide, but saving checks stock in From."
+                                  if transfer else "Item Code: type the code or press F2 in the cell. Issues and adjustments - use automatic cost; receipts and opening stock need a unit cost."))
         if not self.sd_id:
             try: self.sd_vars["number"].set(self.client.next_stock_number(DOC_TYPES[self.sd_vars["type"].get()], self.sd_vars["date"].get()))
             except Exception: self.sd_vars["number"].set("")
@@ -243,7 +247,8 @@ class InventoryMixin:
     def update_stock_total(self):
         rows = [r for r in self.stock_sheet.ordered() if r.get("sku") and _num(r.get("quantity"))]
         total = sum((_num(r["quantity"]) or 0) * (_num(r.get("unit_cost")) or 0) for r in rows)
-        self.sd_total.config(text=f"{len(rows)} line(s)   Total value: {total:,.2f} {getattr(self, 'inventory_currency', '')}")
+        label = "Estimated value (average-cost preview)" if self.sd_vars["type"].get() == "Transfer" else "Total value"
+        self.sd_total.config(text=f"{len(rows)} line(s)   {label}: {total:,.2f} {getattr(self, 'inventory_currency', '')}")
 
     def new_stock_document(self):
         self.sd_id = None; v = self.sd_vars
@@ -251,6 +256,18 @@ class InventoryMixin:
         v["date"].set(self.fiscal_today())
         if not v["warehouse"].get() and getattr(self, "warehouse_rows", None): v["warehouse"].set(f'{self.warehouse_rows[0]["code"]} - {self.warehouse_rows[0]["name"]}')
         self.stock_sheet.clear(); self.add_stock_line(edit=False); self.add_stock_line(edit=False); self.stock_type_changed()
+
+    def new_warehouse_transfer(self):
+        active = [f'{w["code"]} - {w["name"]}' for w in getattr(self, "warehouse_rows", []) if w["active"]]
+        if len(active) < 2:
+            return messagebox.showwarning("Warehouse Transfer", "Create two active warehouses under Warehouses & Settings first.")
+        self.inventory_notebook_select("Stock Documents")
+        self.sd_vars["type"].set("Transfer")
+        self.new_stock_document()
+        source = self.sd_vars["warehouse"].get()
+        if source not in active:
+            source = active[0]; self.sd_vars["warehouse"].set(source)
+        self.sd_vars["to_warehouse"].set(next(name for name in active if name != source))
 
     def load_stock_documents(self):
         if not hasattr(self, "sd_find_box"): return
@@ -283,6 +300,11 @@ class InventoryMixin:
         v = self.sd_vars; lines = [r for r in self.stock_sheet.ordered() if r.get("sku") and _num(r.get("quantity"))]
         if not lines: return messagebox.showwarning("Stock Documents", "Add at least one item with a quantity")
         doc_type = DOC_TYPES[v["type"].get()]
+        if doc_type == "transfer":
+            source = v["warehouse"].get().split(" - ", 1)[0]
+            target = v["to_warehouse"].get().split(" - ", 1)[0]
+            if not source or not target or source == target:
+                return messagebox.showwarning("Warehouse Transfer", "Choose different From and To warehouses.")
         if doc_type in ("opening", "receipt") and any(not _num(r.get("unit_cost")) for r in lines): return messagebox.showwarning("Stock Documents", "Enter the unit cost of every line")
         party = getattr(self, "sd_party_map", {}).get(v["party"].get())
         header = {"doc_type": doc_type, "doc_date": v["date"].get().strip(), "warehouse_id": v["warehouse"].get().split(" - ", 1)[0], "to_warehouse_id": v["to_warehouse"].get().split(" - ", 1)[0],
@@ -516,6 +538,7 @@ class InventoryMixin:
         tk.Label(bar, text="Date", bg=LIGHT).pack(side="left"); self.date_entry(bar, self.sio_vars["date"], 11).pack(side="left", padx=(4, 8))
         tk.Label(bar, text="Warehouse", bg=LIGHT).pack(side="left"); self.sio_wh_box = ttk.Combobox(bar, textvariable=self.sio_vars["warehouse"], state="readonly", width=18); self.sio_wh_box.pack(side="left", padx=(4, 8))
         tk.Label(bar, text="Reason", bg=LIGHT).pack(side="left"); tk.Entry(bar, textvariable=self.sio_vars["reason"], width=28).pack(side="left", padx=4)
+        self.action_button(bar, "Transfer Between Warehouses", self.new_warehouse_transfer).pack(side="right", padx=4)
         bottom = tk.Frame(page, bg=LIGHT); bottom.pack(side="bottom", fill="x", padx=8, pady=6)
         self.action_button(bottom, "Add Line", lambda: self.sio_sheet.insert(self.sio_row())).pack(side="left", padx=(0, 3))
         tk.Button(bottom, text="Delete Line", command=lambda: self.sio_sheet.delete_selected(), bg=RED, fg="white", border=0, padx=10, pady=6).pack(side="left", padx=3)
