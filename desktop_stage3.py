@@ -984,7 +984,8 @@ class Stage3Mixin:
         f["total"].config(text=f"TOTAL TTC: {taxable+exempt-discount+vat:,.2f} {v['currency'].get()}")
 
     def new_purchase(self):
-        f = self.purchase_form; v = f["vars"]; f["id"] = None; f["pdf"] = None; f["vat_typed"] = False; f["pdf_vat_review"] = False; f["pdf_suggested_type"] = ""
+        f = self.purchase_form; v = f["vars"]; f["id"] = None; f["pdf"] = None; f["pdf_pending_invoice_id"] = None
+        f["vat_typed"] = False; f["pdf_vat_review"] = False; f["pdf_suggested_type"] = ""
         for key in ("supplier", "number", "due", "taxable", "exempt", "vat"): v[key].set("")
         v["date"].set(self.fiscal_today()); v["rate"].set("11"); v["type"].set("Purchases"); v["account"].set("601100000"); f["department"].set("(none)"); f["project"].set("(none)")
         f["use"].set("Mixed (partial deduction)"); f["reverse"].set(False)
@@ -995,7 +996,24 @@ class Stage3Mixin:
     def choose_purchase_pdf(self):
         path = filedialog.askopenfilename(filetypes=[("PDF invoice", "*.pdf"), ("Images", "*.png *.jpg *.jpeg")])
         if not path: return
-        f = self.purchase_form; v = f["vars"]; f["pdf"] = path; f["pdf_suggested_type"] = ""
+        f = self.purchase_form
+        try:
+            size = Path(path).stat().st_size
+            if not size or size > 15 * 1024 * 1024:
+                raise ValueError("Choose a non-empty file smaller than 15 MB")
+        except (OSError, ValueError) as exc:
+            return messagebox.showerror("Purchase PDF", f"Could not select this file: {exc}")
+        if f.get("id"):
+            try:
+                self.client.upload_attachment(f["id"], Path(path).name, mimetypes.guess_type(path)[0] or "application/pdf", Path(path).read_bytes())
+            except Exception as exc:
+                return messagebox.showerror("Purchase PDF", f"Could not confirm the PDF attached to purchase {f['id']}: {exc}\nCheck Attachments before trying again.")
+            f["pdf"] = None
+            f["pdf_label"].config(text=f"{Path(path).name} attached to purchase {f['id']}", fg=NAVY)
+            self.load_purchases()
+            return
+        v = f["vars"]
+        f["pdf"] = path; f["pdf_suggested_type"] = ""
         if path.lower().endswith(".pdf"):
             data = read_invoice_pdf(path)
             f["pdf_suggested_type"] = data.get("suggested_type") or ""
@@ -1004,28 +1022,72 @@ class Stage3Mixin:
                 f["vat_typed"] = True
                 v["vat"].set(f'{data["vat"]:.2f}' if data.get("vat") is not None else "")
                 if data.get("invoice_number") and not v["number"].get(): v["number"].set(data["invoice_number"])
+                elif not v["number"].get():
+                    typed = simpledialog.askstring(
+                        "Purchase invoice number",
+                        "The PDF number could not be read. Enter the invoice number as printed, or leave it for later.",
+                        parent=self,
+                    )
+                    if str(typed or "").strip(): v["number"].set(typed.strip())
                 if data.get("invoice_date"): v["date"].set(data["invoice_date"])
                 elif v["date"].get() == self.fiscal_today(): v["date"].set("")
                 if data.get("currency"): v["currency"].set(data["currency"])
                 if data.get("subtotal") and not v["taxable"].get(): v["taxable"].set(f'{data["subtotal"]:.2f}')
                 if data.get("party_name") and not v["supplier"].get(): v["supplier"].set(data["party_name"])
-                if data.get("items") and not f["items_sheet"].ordered():
-                    for item in data["items"]:
-                        self.purchase_item_line({
-                            "item_code": "", "name": item["description"], "quantity": item["quantity"],
-                            "unit": item.get("unit") or "unit", "unit_cost": item["unit_price"],
-                            "discount_percent": 0,
-                        })
+                item_note = self.add_purchase_pdf_items(data)
                 self.purchase_amounts_changed("none")
             suggestion=f["pdf_suggested_type"]
             f["pdf_label"].config(text=f"{Path(path).name}: {data.get('notes', '')}" +
                                   (f"; Suggested Type: {suggestion} (review before Save)" if suggestion else
-                                   "; Type unclear; review Purchases vs Assets before Save"), fg=NAVY)
-        else: f["pdf_label"].config(text=Path(path).name, fg=NAVY)
+                                   "; Type unclear; review Purchases vs Assets before Save") +
+                                  f"; {item_note}; PDF attaches when you press Save", fg=NAVY)
+        else:
+            item_note = self.add_purchase_pdf_items({"items": [], "subtotal": None})
+            f["pdf_label"].config(text=f"{Path(path).name}: {item_note}; attachment saves with purchase on Save", fg=NAVY)
+
+    def add_purchase_pdf_items(self, data):
+        """Create inventory records at upload time; only reviewed lines enter the invoice on Save."""
+        f = self.purchase_form
+        if f["items_sheet"].ordered():
+            return "existing item lines kept; review them before Save"
+        items = data.get("items") or []
+        if not items:
+            name = simpledialog.askstring(
+                "Purchase PDF item",
+                "No readable item row was found. Enter the item name to create it in Inventory now, or Cancel to enter it manually later.",
+                parent=self,
+            )
+            if not str(name or "").strip():
+                return "no item created; enter an item name and upload again"
+            items = [{"description": name.strip(), "quantity": 1, "unit_price": data.get("subtotal") or 0, "unit": "unit"}]
+        party = f.get("supplier_map", {}).get(f["vars"]["supplier"].get())
+        created = 0
+        for row in items:
+            try:
+                item = self.client.find_or_create_item(
+                    row["description"], row.get("unit") or "unit", None, party["id"] if party else None,
+                )
+            except Exception as exc:
+                messagebox.showerror("Purchase PDF item", f"{created} item(s) added; could not create {row['description']}: {exc}")
+                break
+            self.purchase_item_line({
+                "item_code": item["sku"], "name": item["name"], "quantity": row["quantity"],
+                "unit": item["unit"], "unit_cost": row["unit_price"], "discount_percent": 0,
+            })
+            created += 1
+        if created:
+            self.load_inventory()
+        return f"{created} item(s) created or matched in Inventory; review quantity and price before Save"
 
     def ai_read_purchase_pdf(self):
         path=filedialog.askopenfilename(filetypes=[("PDF invoice","*.pdf")])
         if not path: return
+        try:
+            size = Path(path).stat().st_size
+            if not size or size > 15 * 1024 * 1024:
+                raise ValueError("Choose a non-empty PDF smaller than 15 MB")
+        except (OSError, ValueError) as exc:
+            return messagebox.showerror("Purchase PDF", f"Could not select this file: {exc}")
         from ai_service import read_invoice_pdf as read_ai_pdf
         def show(data):
             f=self.purchase_form; v=f["vars"]; f["pdf"]=path
@@ -1037,11 +1099,9 @@ class Stage3Mixin:
                 if f["items_sheet"].ordered() and not messagebox.askyesno("AI PDF preview", "Replace the current purchase item lines with the suggested lines?"):
                     return
                 f["items_sheet"].clear()
-                for item in data["items"]:
-                    self.purchase_item_line({"item_code": "", "name": item["description"], "quantity": item["quantity"],
-                                             "unit": item.get("unit") or "unit", "unit_cost": item["unit_price"], "discount_percent": 0})
+            item_note = self.add_purchase_pdf_items(data)
             self.purchase_amounts_changed("none")
-            f["pdf_label"].config(text=f"AI preview of page 1: {Path(path).name} — review before Save",fg=NAVY)
+            f["pdf_label"].config(text=f"AI preview of page 1: {Path(path).name} — {item_note}; PDF attaches on Save",fg=NAVY)
         self.run_ai_task(lambda key:read_ai_pdf(path,key),show)
 
     def ai_read_sales_pdf(self):
@@ -1120,6 +1180,29 @@ class Stage3Mixin:
 
     def save_purchase(self):
         f = self.purchase_form
+        pending_id = f.get("pdf_pending_invoice_id")
+        if pending_id and f.get("id") == pending_id and f.get("pdf"):
+            try:
+                content = Path(f["pdf"]).read_bytes()
+                attachments = self.client.attachments(pending_id)
+                matching = (a for a in attachments if a["file_name"] == Path(f["pdf"]).name and a["size"] == len(content))
+                if not any(self.client.download_attachment(a["id"])["content"] == content for a in matching):
+                    self.client.upload_attachment(pending_id, Path(f["pdf"]).name,
+                                                  mimetypes.guess_type(f["pdf"])[0] or "application/pdf", content)
+            except Exception as exc:
+                return messagebox.showwarning("Purchases",
+                    f"Purchase {pending_id} is already SAVED; PDF is not confirmed attached: {exc}\n"
+                    "Press Save to retry ONLY the PDF, or check Attachments. Do not create the invoice again.")
+            self.new_purchase(); self.load_purchases(); self.load_invoices(); self.load_journal(); self.load_trial()
+            return messagebox.showinfo("Purchases", f"PDF attached to the already saved purchase {pending_id}; invoice was not posted again.")
+        if pending_id:
+            f["pdf_pending_invoice_id"] = None
+        try:
+            pdf_content = Path(f["pdf"]).read_bytes() if f.get("pdf") else None
+            if pdf_content is not None and (not pdf_content or len(pdf_content) > 15 * 1024 * 1024):
+                raise ValueError("PDF must be non-empty and smaller than 15 MB")
+        except (OSError, ValueError) as exc:
+            return messagebox.showerror("Purchases", f"PDF cannot be read; purchase not saved: {exc}")
         try: invoice, lines = self.purchase_payload()
         except ValueError as exc: return messagebox.showwarning("Purchases", str(exc))
         suggestion=f.get("pdf_suggested_type")
@@ -1131,8 +1214,20 @@ class Stage3Mixin:
                 return
         try:
             invoice_id = self.client.replace_invoice(f["id"], invoice, lines) if f["id"] else self.client.create_manual_invoice(invoice, lines)["invoice_id"]
-            if f["pdf"]: self.client.upload_attachment(invoice_id, Path(f["pdf"]).name, mimetypes.guess_type(f["pdf"])[0] or "application/pdf", Path(f["pdf"]).read_bytes())
-        except Exception as exc: return messagebox.showerror("Purchases", str(exc))
+        except Exception as exc:
+            return messagebox.showerror("Purchases", f"{exc}\nIf the result is uncertain, check the purchase list before retrying.")
+        if pdf_content is not None:
+            try:
+                self.client.upload_attachment(invoice_id, Path(f["pdf"]).name,
+                                              mimetypes.guess_type(f["pdf"])[0] or "application/pdf", pdf_content)
+            except Exception as exc:
+                f["id"] = invoice_id
+                f["pdf_pending_invoice_id"] = invoice_id
+                f["pdf_label"].config(text=f"Purchase {invoice_id} SAVED, PDF not attached; press Save to retry PDF only", fg=RED)
+                self.load_purchases(); self.load_invoices(); self.load_journal(); self.load_trial()
+                return messagebox.showwarning("Purchases",
+                    f"Purchase {invoice_id} is SAVED, but the PDF attachment failed: {exc}\n"
+                    "Press Save again to retry ONLY the PDF; the purchase and its items will not be posted twice.")
         messagebox.showinfo("Purchases", "Purchase invoice saved" + (" with its PDF" if f["pdf"] else ""))
         self.new_purchase(); self.load_purchases(); self.load_invoices(); self.load_journal(); self.load_trial()
 

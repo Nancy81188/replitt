@@ -279,8 +279,13 @@ def _parse_invoice_text(path, text):
     result["suggested_type"] = suggest_invoice_type(text)
     if len(text.strip()) < 20:
         result["notes"] = "This PDF is a scanned image (no text inside). The file will be attached; enter the amounts manually."; return result
-    match = re.search(r"(?:invoice|inv|facture|فاتورة|bill)\s*(?:no\.?|number|num|#|n°|رقم)?\s*[:#.]?\s*([A-Z0-9][A-Z0-9\-/]{1,24})", text, re.I)
-    if match and any(ch.isdigit() for ch in match.group(1)): result["invoice_number"] = match.group(1).strip("-/")
+    match = re.search(
+        r"(?:invoice|inv|facture|فاتورة|رقم\s*(?:ال)?فاتورة|n°\s*facture|bill)"
+        r"\s*(?:no\.?|number|num|#|n°|رقم)?\s*[:#.]?\s*([A-Z\d][A-Z\d\-/]{1,24})",
+        text, re.I,
+    )
+    if match and any(ch.isdigit() for ch in match.group(1)):
+        result["invoice_number"] = _normalize_amount_line(match.group(1)).strip("-/")
     for pattern, order in DATE_PATTERNS:
         for groups in re.findall(pattern, text):
             try:

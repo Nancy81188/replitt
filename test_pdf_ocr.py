@@ -122,6 +122,17 @@ class OcrPageTests(unittest.TestCase):
         self.assertIn("type 0 if none", warning.call_args.args[1])
         client.import_invoices.assert_not_called()
 
+    def test_invoice_number_labels_and_arabic_digits_from_pdf_text(self):
+        for header, expected in (
+            ("رقم الفاتورة: ١٢٣", "123"),
+            ("فاتورة رقم: ٤٥٦", "456"),
+            ("N° Facture: F-2026/007", "F-2026/007"),
+            ("Invoice No: INV-2026-31", "INV-2026-31"),
+        ):
+            with self.subTest(header=header):
+                text = f"{header}\nDate: 15/03/2026\nSupplier Co\nTotal: 100"
+                self.assertEqual(_parse_invoice_text("invoice.pdf", text)["invoice_number"], expected)
+
     def test_arabic_amount_label_variants_and_rtl_number_first_rows(self):
         text = ("فاتورة رقم 45\nالتاريخ 15/03/2026\n"
                 "١٬٢٠٠٫٥٠ : الإجمالي قبل الضريبة\n"
@@ -500,6 +511,7 @@ class OcrPageTests(unittest.TestCase):
         purchase=types.SimpleNamespace(purchase_form={"id":None,"vars":purchase_vars,
             "items_sheet":types.SimpleNamespace(ordered=lambda:[]),"pdf_label":Mock()},
             fiscal_today=lambda:"15-03-2026",purchase_amounts_changed=Mock())
+        purchase.add_purchase_pdf_items=lambda data: Stage3Mixin.add_purchase_pdf_items(purchase,data)
         expense_vars={key:Field(value) for key,value in
                       (("vat",""),("reference",""),("date","15-03-2026"),
                        ("currency","USD"),("description",""),("with_vat",""))}
@@ -508,16 +520,140 @@ class OcrPageTests(unittest.TestCase):
         data={"suggested_type":"Assets","vat":11,"invoice_number":"A-1",
               "invoice_date":"15-03-2026","currency":"USD","subtotal":100,
               "party_name":"Supplier","notes":"Read from PDF - please check"}
-        with patch("desktop_stage3.filedialog.askopenfilename",return_value="asset.pdf"), \
-             patch("desktop_stage3.read_invoice_pdf",return_value=data):
-            Stage3Mixin.choose_purchase_pdf(purchase)
-            Stage3Mixin.choose_expense_pdf(expense)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "asset.pdf"; path.write_bytes(b"%PDF-1.4\n")
+            with patch("desktop_stage3.filedialog.askopenfilename",return_value=str(path)), \
+                 patch("desktop_stage3.read_invoice_pdf",return_value=data), \
+                 patch("desktop_stage3.simpledialog.askstring",return_value=None):
+                Stage3Mixin.choose_purchase_pdf(purchase)
+                Stage3Mixin.choose_expense_pdf(expense)
         self.assertEqual(purchase_vars["type"].get(),"Purchases")
         self.assertEqual(purchase_vars["number"].get(),"A-1")
         self.assertEqual(purchase.purchase_form["pdf_suggested_type"],"Assets")
         self.assertEqual(expense.expense_form["pdf_suggested_type"],"Assets")
         self.assertIn("Suggested Type: Assets",purchase.purchase_form["pdf_label"].config.call_args.kwargs["text"])
         self.assertIn("Suggested Type: Assets",expense.expense_form["pdf_label"].config.call_args.kwargs["text"])
+
+    def test_purchase_pdf_upload_creates_inventory_items_immediately_and_saves_pdf_with_invoice(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "goods.pdf"; path.write_bytes(b"%PDF-1.4\nsample")
+            rows = []
+            client = types.SimpleNamespace(
+                find_or_create_item=Mock(side_effect=lambda name, unit, sku, supplier:
+                    {"sku": "ITM-00001", "name": name, "unit": unit}),
+                create_manual_invoice=Mock(return_value={"invoice_id": 92}),
+                upload_attachment=Mock(),
+            )
+            form = {"id": None, "pdf": None, "pdf_label": Mock(),
+                    "items_sheet": types.SimpleNamespace(ordered=lambda: rows),
+                    "vars": {"supplier": types.SimpleNamespace(get=lambda: ""),
+                             "number": types.SimpleNamespace(get=lambda: "", set=Mock()),
+                             "date": types.SimpleNamespace(get=lambda: "", set=Mock()),
+                             "vat": types.SimpleNamespace(set=Mock()),
+                             "currency": types.SimpleNamespace(set=Mock()),
+                             "taxable": types.SimpleNamespace(get=lambda: "", set=Mock())}}
+            screen = types.SimpleNamespace(
+                purchase_form=form, client=client, load_inventory=Mock(),
+                purchase_item_line=lambda row: rows.append(row),
+                purchase_amounts_changed=Mock(), fiscal_today=lambda: "15-03-2026",
+                purchase_payload=Mock(return_value=({"invoice_number": "SUP-42"}, [{"item_code": "ITM-00001"}])),
+                new_purchase=Mock(), load_purchases=Mock(), load_invoices=Mock(),
+                load_journal=Mock(), load_trial=Mock(),
+            )
+            screen.add_purchase_pdf_items=lambda data: Stage3Mixin.add_purchase_pdf_items(screen,data)
+            data = {"invoice_number": "SUP-42", "items": [
+                {"description": "Blue pens", "quantity": 2, "unit_price": 10, "unit": "box"}],
+                "subtotal": 20, "vat": 0, "notes": "Read from PDF - please check"}
+            with patch("desktop_stage3.filedialog.askopenfilename", return_value=str(path)), \
+                 patch("desktop_stage3.read_invoice_pdf", return_value=data):
+                Stage3Mixin.choose_purchase_pdf(screen)
+            self.assertEqual(rows[0]["item_code"], "ITM-00001")
+            self.assertEqual(rows[0]["name"], "Blue pens")
+            self.assertEqual(client.find_or_create_item.call_args.args[:2], ("Blue pens", "box"))
+            self.assertEqual(form["pdf"], str(path))
+            self.assertIn("PDF attaches when you press Save", form["pdf_label"].config.call_args.kwargs["text"])
+            with patch("desktop_stage3.messagebox.showinfo"):
+                Stage3Mixin.save_purchase(screen)
+            client.create_manual_invoice.assert_called_once()
+            client.upload_attachment.assert_called_once_with(92, path.name, "application/pdf", path.read_bytes())
+
+    def test_purchase_pdf_without_readable_rows_asks_for_item_name(self):
+        rows = []
+        screen = types.SimpleNamespace(
+            purchase_form={"items_sheet": types.SimpleNamespace(ordered=lambda: rows),
+                           "vars": {"supplier": types.SimpleNamespace(get=lambda: "")}},
+            client=types.SimpleNamespace(find_or_create_item=Mock(return_value={
+                "sku": "ITM-00002", "name": "Paper", "unit": "unit"})),
+            purchase_item_line=lambda row: rows.append(row), load_inventory=Mock(),
+        )
+        with patch("desktop_stage3.simpledialog.askstring", return_value="Paper"):
+            note = Stage3Mixin.add_purchase_pdf_items(screen, {"items": [], "subtotal": 50})
+        self.assertEqual((rows[0]["name"], rows[0]["unit_cost"]), ("Paper", 50))
+        self.assertIn("1 item(s)", note)
+        self.assertEqual(screen.client.find_or_create_item.call_count, 1)
+
+    def test_purchase_attachment_failure_retries_only_attachment_not_invoice(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "goods.pdf"; path.write_bytes(b"%PDF-1.4\nsample")
+            client = types.SimpleNamespace(
+                create_manual_invoice=Mock(return_value={"invoice_id": 92}),
+                upload_attachment=Mock(side_effect=[OSError("offline"), {"attachment_id": 7}]),
+                attachments=Mock(return_value=[]),
+            )
+            form = {"id": None, "pdf": str(path), "pdf_label": Mock(),
+                    "pdf_suggested_type": "", "vars": {}}
+            screen = types.SimpleNamespace(
+                purchase_form=form, client=client,
+                purchase_payload=Mock(return_value=({"invoice_number": "SUP-42"}, [{"item_code": "ITM-00001"}])),
+                new_purchase=Mock(), load_purchases=Mock(), load_invoices=Mock(),
+                load_journal=Mock(), load_trial=Mock(),
+            )
+            with patch("desktop_stage3.messagebox.showwarning") as warning, \
+                 patch("desktop_stage3.messagebox.showinfo"):
+                Stage3Mixin.save_purchase(screen)
+                self.assertEqual(form["pdf_pending_invoice_id"], 92)
+                self.assertIn("SAVED", warning.call_args.args[1])
+                Stage3Mixin.save_purchase(screen)
+            client.create_manual_invoice.assert_called_once()
+            screen.purchase_payload.assert_called_once()
+            self.assertEqual(client.upload_attachment.call_count, 2)
+            screen.new_purchase.assert_called_once()
+
+    def test_purchase_attachment_retry_detects_pdf_already_saved_after_timeout(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "goods.pdf"; path.write_bytes(b"%PDF-1.4\nsample")
+            content = path.read_bytes()
+            client = types.SimpleNamespace(
+                create_manual_invoice=Mock(return_value={"invoice_id": 92}),
+                upload_attachment=Mock(side_effect=TimeoutError("response lost")),
+                attachments=Mock(return_value=[{"id": 7, "file_name": path.name, "size": len(content)}]),
+                download_attachment=Mock(return_value={"content": content}),
+            )
+            form = {"id": None, "pdf": str(path), "pdf_label": Mock(), "vars": {}}
+            screen = types.SimpleNamespace(
+                purchase_form=form, client=client,
+                purchase_payload=Mock(return_value=({"invoice_number": "SUP-42"}, [{"item_code": "ITM-00001"}])),
+                new_purchase=Mock(), load_purchases=Mock(), load_invoices=Mock(),
+                load_journal=Mock(), load_trial=Mock(),
+            )
+            with patch("desktop_stage3.messagebox.showwarning"), patch("desktop_stage3.messagebox.showinfo"):
+                Stage3Mixin.save_purchase(screen)
+                Stage3Mixin.save_purchase(screen)
+            client.create_manual_invoice.assert_called_once()
+            client.upload_attachment.assert_called_once()
+            client.download_attachment.assert_called_once_with(7)
+            screen.new_purchase.assert_called_once()
+
+    def test_adding_pdf_to_existing_purchase_attaches_immediately(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "goods.pdf"; path.write_bytes(b"%PDF-1.4\nsample")
+            client = types.SimpleNamespace(upload_attachment=Mock())
+            form = {"id": 92, "pdf": None, "pdf_label": Mock()}
+            screen = types.SimpleNamespace(purchase_form=form, client=client, load_purchases=Mock())
+            with patch("desktop_stage3.filedialog.askopenfilename", return_value=str(path)):
+                Stage3Mixin.choose_purchase_pdf(screen)
+            client.upload_attachment.assert_called_once_with(92, path.name, "application/pdf", path.read_bytes())
+            self.assertIsNone(form["pdf"])
 
     def test_sales_pdf_previews_keep_the_read_invoice_number_after_date_refresh(self):
         class Field:
