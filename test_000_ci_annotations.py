@@ -10,6 +10,7 @@ import unittest
 
 
 if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+    print("::notice title=CI diagnostics::Unittest failure annotations are active", flush=True)
     _add_failure = unittest.TestResult.addFailure
     _add_error = unittest.TestResult.addError
 

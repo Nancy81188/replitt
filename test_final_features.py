@@ -1,6 +1,7 @@
 """Tests for version 1.12: payroll official reports, quarterly VAT, user expiry/permissions,
 legal-document alerts, and a full standalone run including backup and restore."""
 import socket
+import os
 import sqlite3
 import tempfile
 import threading
@@ -1028,6 +1029,14 @@ class DeleteYearTest(unittest.TestCase):
                 other.execute("INSERT INTO app_settings(key,value) VALUES(?,?)",("archive_probe","committed_in_wal"))
                 other.commit()
                 self.assertTrue(Path(str(path)+"-wal").exists())
+                if os.name == "nt":
+                    # Windows refuses to rename a SQLite file while another connection
+                    # still has it open. The year must remain available for a safe retry.
+                    with self.assertRaisesRegex(ValueError,"Close other programs"):
+                        manager.delete_year(company,2025,1)
+                    self.assertTrue(path.is_file())
+                    self.assertEqual([record["year"] for record in manager.list_companies()[0]["years"]],[2024,2025])
+                    other.close()
                 result=manager.delete_year(company,2025,1)
             finally:
                 other.close()
@@ -1035,6 +1044,27 @@ class DeleteYearTest(unittest.TestCase):
                 self.assertEqual(archived.execute("PRAGMA integrity_check").fetchone()[0],"ok")
                 self.assertEqual(archived.execute("SELECT value FROM app_settings WHERE key='archive_probe'").fetchone()[0],"committed_in_wal")
             self.assertEqual([record["year"] for record in manager.list_companies()[0]["years"]],[2024])
+
+    def test_locked_year_file_is_not_deleted(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            root=Path(folder); Database(root/"master.db").initialize("secret")
+            manager=CompanyManager(root/"master.db")
+            company=manager.list_companies()[0]["id"]
+            manager.create_year(company,2025,1)
+            path=Path(manager.database(company,2025).path)
+            replace=Path.replace
+
+            def locked_replace(source,target):
+                if source==path:
+                    raise PermissionError("database file is in use")
+                return replace(source,target)
+
+            with patch.object(Path,"replace",new=locked_replace):
+                with self.assertRaisesRegex(ValueError,"Close other programs"):
+                    manager.delete_year(company,2025,1)
+            self.assertTrue(path.is_file())
+            self.assertEqual([record["year"] for record in manager.list_companies()[0]["years"]],[2024,2025])
+            self.assertTrue(manager.delete_year(company,2025,1)["backup"])
 
     def test_failed_archive_verification_keeps_fiscal_year_available(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:

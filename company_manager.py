@@ -243,7 +243,10 @@ class CompanyManager:
                 with closing(sqlite3.connect(str(path))) as source:
                     if source.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]:
                         raise ValueError("Close other programs using this fiscal year before deleting it")
-                path.replace(retired)
+                try:
+                    path.replace(retired)
+                except PermissionError as exc:
+                    raise ValueError("Close other programs using this fiscal year before deleting it") from exc
                 try:
                     temporary.replace(backup)
                     company["years"]=[y for y in company["years"] if int(y["year"])!=year]
