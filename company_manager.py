@@ -127,7 +127,7 @@ class CompanyManager:
             safe=self.safe_name(company["name"],company["id"])
             database.backup_folder=str(self.master_path.parent/"backups"/safe/str(selected["year"])); database.backup_label=f'{safe}_{selected["year"]}'
             # Bring files made by an older version up to date (new tables and columns); existing data is kept.
-            if Path(path).exists() and Path(path)!=self.master_path: database.initialize(secrets.token_urlsafe(24))
+            if Path(path).exists() and Path(path)!=self.master_path: database.initialize_if_needed(secrets.token_urlsafe(24))
             self._cache[path]=database
         return self._cache[path]
 
