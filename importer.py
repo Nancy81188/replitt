@@ -23,6 +23,9 @@ ALIASES = {
     "vat": {"vat", "tva", "ضريبة", "الضريبة"},
     "total": {"total after vat", "total", "grand total", "بعد الضريبة", "ttc"},
     "currency": {"currency", "curr", "العملة", "devise"},
+    "deductible": {"deductible", "deductible value", "deductible amount", "قابل للحسم"},
+    "non_deductible": {"non deductible", "non deductible value", "non deductible amount", "غير قابل للحسم"},
+    "items": {"items", "item description", "description", "details", "الأصناف"},
     "kind": {"type", "invoice type", "نوع", "nature"},
     "supplier_account": {"supplier account number", "supplier account", "supplier account no", "supplier a/c", "حساب المورد", "compte fournisseur"},
     "vat_account": {"vat account number", "vat account", "vat account no", "vat a/c", "حساب الضريبة", "compte tva"},
@@ -190,7 +193,9 @@ def read_invoices(path: str | Path, sheet_name: str | None = None, default_curre
         header = next(value_rows)
         next(formula_rows)
         columns = _columns(header)
-        required = {"date", "party", "subtotal", "vat", "total"}
+        required = {"date", "party"}
+        if not any(field in columns for field in ("subtotal", "total", "deductible", "non_deductible")):
+            raise ValueError("Add a subtotal, total, deductible or non-deductible column")
         if not required.issubset(columns):
             missing = ", ".join(sorted(required - set(columns)))
             raise ValueError(f"Missing required columns: {missing}")
@@ -203,8 +208,11 @@ def read_invoices(path: str | Path, sheet_name: str | None = None, default_curre
                 idx = columns.get(field)
                 return values[idx] if idx is not None and idx < len(values) else default
             subtotal, vat, total = (_decimal(get(field),allowed_currencies) for field in ("subtotal","vat","total"))
-            if subtotal is not None and vat is None:
-                vat = (subtotal * VAT_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            deductible = _decimal(get("deductible"), allowed_currencies)
+            non_deductible = _decimal(get("non_deductible"), allowed_currencies)
+            if subtotal is None and deductible is not None and non_deductible is not None: subtotal = deductible + non_deductible
+            if subtotal is None and total is not None and vat is not None: subtotal = total - vat
+            if vat is None and total is not None and subtotal is not None: vat = total - subtotal
             if total is None and subtotal is not None and vat is not None:
                 total = subtotal + vat
             invoice_number = str(get("invoice_number") or row_number).strip()
@@ -215,6 +223,9 @@ def read_invoices(path: str | Path, sheet_name: str | None = None, default_curre
                 "invoice_date": _date(get("date")),
                 "party_name": str(get("party") or "").strip(),
                 "subtotal": float(subtotal) if subtotal is not None else None,
+                "deductible": float(deductible) if deductible is not None else None,
+                "non_deductible": float(non_deductible) if non_deductible is not None else None,
+                "items": str(get("items") or "").strip(),
                 "vat": float(vat) if vat is not None else None,
                 "total": float(total) if total is not None else None,
                 "currency": currency,
@@ -250,7 +261,8 @@ def read_expenses(path):
     try:
         sheet = workbook.worksheets[0]
         header, columns = _header_map(sheet, {"date": ("date", "تاريخ"), "description": ("description", "details", "بيان", "libell"), "category": ("category", "type"),
-            "currency": ("currency", "devise", "عملة"), "without_vat": ("without vat", "no vat", "exempt"), "vat": ("vat", "tva", "tax"),
+            "currency": ("currency", "devise", "عملة"), "without_vat": ("without vat", "no vat", "exempt", "non deductible"), "vat": ("vat", "tva", "tax"),
+            "supplier": ("supplier", "vendor", "fournisseur", "المورد"), "total": ("ttc", "grand total", "total after vat"), "items": ("items", "item name", "الأصناف"),
             "amount": ("amount", "before vat", "subtotal", "montant", "مبلغ"), "reference": ("reference", "ref", "invoice", "رقم")})
         if "amount" not in columns and "without_vat" not in columns: raise ValueError("Add an Amount column to the Excel file")
         rows = []
@@ -261,11 +273,13 @@ def read_expenses(path):
                 value = get(field)
                 try: return float(str(value).replace(",", "")) if value not in (None, "") else 0.0
                 except ValueError: raise ValueError(f"Row {number}: {field.replace('_', ' ')} must be a number")
-            amount = money("amount"); without = money("without_vat"); vat = money("vat") if "vat" in columns else round(amount * 0.11, 2)
+            amount = money("amount"); without = money("without_vat"); vat = money("vat") if "vat" in columns else 0.0
+            if "total" in columns and "vat" not in columns: vat = round(money("total") - amount - without, 2)
+            if vat < 0: raise ValueError(f"Row {number}: TTC is smaller than the base amounts")
             if not amount and not without: continue
             rows.append({"expense_date": _date(get("date")), "description": str(get("description") or get("reference") or f"Expense row {number}").strip(),
                          "category": str(get("category") or "General").strip(), "currency": str(get("currency") or "USD").strip().upper()[:3],
-                         "with_vat_subtotal": amount, "without_vat_subtotal": without, "vat": vat, "reference": str(get("reference") or "").strip(), "source_row": number})
+                         "with_vat_subtotal": amount, "without_vat_subtotal": without, "vat": vat, "reference": str(get("reference") or "").strip(), "supplier": str(get("supplier") or "").strip(), "items": str(get("items") or "").strip(), "source_row": number})
         return rows
     finally: workbook.close()
 
