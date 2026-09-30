@@ -3314,7 +3314,9 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         parents={str(row["code"]):row for row in all_accounts if len(str(row.get("code") or ""))==4 and str(row["code"]).isdigit()}
         previous_grab=self.grab_current()
         window=tk.Toplevel(self); window.title("Find or Create Account - F2")
-        self.fit_dialog(window,820,590,320,320)
+        fit_dialog=getattr(self,"fit_dialog",None)
+        if fit_dialog: fit_dialog(window,820,590,320,320)
+        else: SaberApp.fit_dialog(self,window,820,590,320,320)
         window.configure(bg=LIGHT); window.transient(previous_grab or self); window.grab_set()
         def close_lookup():
             window.destroy()
