@@ -450,11 +450,9 @@ def issue_for_invoice(database, invoice_id, lines, user_id):
         "movement_type":"purchase_return" if returned and not is_sale else doc_type}
     if doc_type=="receipt" and is_sale and not invoice.get("linked_invoice_id"):
         # Older manually entered sales credit notes have no source invoice/item to
-        # recover costing layers from. Preserve their historical moving-average
-        # behavior, while requiring linked returns for FIFO where the layer cannot
-        # be established safely.
-        if settings(database)["method"]=="fifo":
-            raise ValueError("Link this sales credit note to its original invoice to restore FIFO stock safely")
+        # recover the original cost layer from. Use the current moving average as
+        # an explicit fallback receipt layer so legacy notes remain postable under
+        # either costing method.
         state=run_costing(database,date)
         for line in indexed:
             with database.connect() as db:

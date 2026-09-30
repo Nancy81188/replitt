@@ -828,6 +828,17 @@ class InventoryTest(unittest.TestCase):
         self.db.delete_invoice(credit, self.user)
         self.assertEqual(self.item("ITM-00001")["quantity"], 70)
 
+    def test_unlinked_legacy_credit_note_can_return_stock_under_fifo(self):
+        inventory.save_settings(self.db, {"currency": "USD", "method": "fifo"}, self.user)
+        credit = self.db.create_manual_invoice(
+            {"invoice_date": "20-03-2024", "party_name": "Tower Client", "kind": "sales", "currency": "USD", "status": "posted",
+             "doc_subtype": "credit_note", "invoice_number": self.db.next_invoice_number("credit_note", "20-03-2024"),
+             "supplier_side": "C - Credit", "vat_side": "D - Debit", "expense_side": "D - Debit", "expense_account": "709000001"},
+            [{"description": "HPL return", "quantity": 10, "unit_price": 120, "item_code": "ITM-00001"}], self.user)
+        stock = next(d for d in inventory.list_documents(self.db) if d.get("invoice_id") == credit)
+        self.assertEqual(stock["doc_type"], "receipt")
+        self.assertEqual(self.item("ITM-00001")["quantity"], 80)
+
     def test_transfer_adjustment_fifo_and_negative_protection(self):
         inventory.save_document(self.db, {"doc_type": "transfer", "doc_date": "20-03-2024", "warehouse_id": "MAIN", "to_warehouse_id": "WH01"}, [{"sku": "ITM-00001", "quantity": 10}], self.user)
         with self.assertRaisesRegex(ValueError, "Not enough stock of ITM-00001 in WH01"):
