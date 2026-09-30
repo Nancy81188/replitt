@@ -39,6 +39,33 @@ class EmployeeRegistrationTest(unittest.TestCase):
             self.assertEqual(may_pay["employer_medical"], 10400000)
             self.assertEqual((april_pay["employer_family"], may_pay["employer_family"]), (1080000, 1680000))
 
+    def test_salary_tax_uses_only_half_child_deduction_when_spouse_works(self):
+        with TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "company.db")
+            db.initialize("secret12345")
+            with db.connect() as connection:
+                user_id = connection.execute("SELECT id FROM users WHERE username='admin'").fetchone()[0]
+            db.apply_lebanese_payroll_rules(user_id)
+            employee = db.save_employee({"full_name": "Tax Example", "currency": "LBP",
+                "base_salary": "100000000", "marital_status": "married",
+                "spouse_works": True, "children": 2}, user_id)
+            for period in ("2024-12-31", "2026-09-30"):
+                settings = db.payroll_settings_for(period)
+                self.assertEqual(settings["tax_brackets"][0], [360000000, 0.02])
+                self.assertEqual(settings["single_allowance"], "450000000")
+                self.assertEqual(settings["child_allowance"], "45000000")
+                result = db.calculate_payroll({"employee_id": employee["id"], "period_date": period})
+                annual_taxable = 1200000000 - 450000000 - 45000000
+                expected = db._progressive_tax(annual_taxable, settings["tax_brackets"]) / 12
+                rounding = int(settings["tax_rounding"])
+                if rounding:
+                    from decimal import Decimal, ROUND_CEILING
+                    expected = (expected / Decimal(rounding)).to_integral_value(rounding=ROUND_CEILING) * Decimal(rounding)
+                self.assertEqual(result["income_tax_lbp"], float(expected))
+            employee = db.save_employee({**employee, "spouse_works": False}, user_id)
+            without_working_spouse = db.calculate_payroll({"employee_id": employee["id"], "period_date": "2026-09-30"})
+            self.assertLess(without_working_spouse["income_tax_lbp"], result["income_tax_lbp"])
+
     def test_registration_fields_are_saved_and_preserved_on_edit(self):
         with TemporaryDirectory() as folder:
             db = Database(Path(folder) / "company.db")
