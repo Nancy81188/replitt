@@ -84,7 +84,7 @@ def natural_sort_value(value):
 class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScreensMixin, FinalFeaturesMixin, tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Saber Accounting 2.9.23")
+        self.title("Saber Accounting 2.9.29")
         screen_width, screen_height = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{min(1180, screen_width)}x{min(720, screen_height)}")
         self.minsize(min(760, screen_width), min(480, screen_height))
@@ -582,20 +582,22 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         if self.can_use("payroll"): builders.append(self.build_payroll)
         if self.can_use("vat"): builders.append(self.build_vat_return)
         builders+=[self.build_journal,self.build_trial,self.build_profit_loss,self.build_financial_reports,self.build_statement,self.build_accounts,self.build_settings]
-        # Faster opening: the Dashboard is built at once and shown; the other pages are built one by one
-        # in the background right after (a page the user opens first, or any page element another
-        # screen needs, is built immediately - see __getattr__ / build_pending_pages).
+        # Build the Dashboard now. Other pages wait until selected or explicitly needed;
+        # expensive hidden reports must not compete with the first screen for the UI thread.
         self._page_generation=getattr(self,"_page_generation",0)+1
         self._pending_builders=list(builders[1:])
         self._run_page_builder(builders[0])
         self.update_idletasks()
         generation=self._page_generation
-        self.after(30,lambda:self._build_next_page(generation))
-        self.after(700,lambda:self.show_document_alerts(startup=True))
+        self.after(700,lambda:self.show_document_alerts(startup=True)
+                   if generation==self.__dict__.get("_page_generation") and self.client else None)
 
     def _run_page_builder(self,build):
         self.__dict__["_building_depth"]=self.__dict__.get("_building_depth",0)+1
-        try: build()
+        try:
+            build()
+            # Bind newly created controls while missing widgets cannot trigger eager loading.
+            self.setup_context_f2()
         except Exception as exc:
             traceback.print_exc(); messagebox.showerror("Saber Accounting",f"A page could not be loaded ({build.__name__.replace('build_','').replace('_',' ')}): {exc}\n\nThe other pages are still available.")
         finally: self.__dict__["_building_depth"]-=1
@@ -605,7 +607,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         pending=self.__dict__.get("_pending_builders")
         if pending:
             self._run_page_builder(pending.pop(0))
-        if pending: self.after(1,lambda:self._build_next_page(generation))
+        if pending: self.after(30,lambda:self._build_next_page(generation))
         elif self.__dict__.get("_pages_finished_for")!=generation: self._pages_finished_for=generation; self._finish_pages()
 
     def build_pending_pages(self):
@@ -670,12 +672,37 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         elif direction<0 and current==0: start=max(0,len(self.main_tab_pages)-6)
         self.show_tab_window(start,target)
 
+    def _ensure_main_tab(self,page):
+        """Build only the requested tab; leave unrelated tabs waiting until needed."""
+        try: index=self.main_tab_pages.index(page)
+        except (AttributeError,ValueError): return
+        names={"dashboard_tab": ("build_dashboard",), "invoices_tab": ("build_invoices",),
+            "sales_tab": ("build_sales_invoice",), "manual_tab": ("build_manual",),
+            "import_tab": ("build_import",), "parties_tab": ("build_parties",),
+            "transactions_tab": ("build_transactions",), "purchases_tab": ("build_purchases_expenses",),
+            "inventory_tab": ("build_inventory",), "payroll_tab": ("build_payroll",),
+            "vat_tab": ("build_vat_return",), "journal_tab": ("build_journal",),
+            "account_reports_tab": ("build_trial","build_statement","build_accounts"),
+            "pnl_tab": ("build_profit_loss",), "reports_tab": ("build_financial_reports",),
+            "settings_tab": ("build_settings",)}
+        page_name=self.main_tab_pages[index]
+        attribute=next((name for name in names if getattr(getattr(self.__dict__.get(name),"master",None),"master",None) is page_name),None)
+        pending=self.__dict__.get("_pending_builders") or []
+        for builder_name in names.get(attribute,()):
+            builder=next((item for item in pending if item.__name__==builder_name),None)
+            if builder is not None:
+                pending.remove(builder)
+                self._run_page_builder(builder)
+
     def select_main_tab(self,page):
-        if self.__dict__.get("_pending_builders"): self.build_pending_pages()
+        self._ensure_main_tab(page)
         self.main_notebook.select(page); self.highlight_main_tab()
 
     def highlight_main_tab(self):
         selected=self.main_notebook.select()
+        if selected:
+            page=next((item for item in getattr(self,"main_tab_pages",[]) if str(item)==selected),None)
+            if page is not None: self._ensure_main_tab(page)
         for page,button in zip(getattr(self,"main_tab_pages",[]),getattr(self,"tab_buttons",[])):
             button.config(bg=GOLD if str(page)==selected else NAVY,fg=NAVY if str(page)==selected else "white")
 
@@ -1307,7 +1334,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
             tk.Button(toolbar,text=text,command=command,bg=NAVY,fg="white",border=0,padx=10,pady=4).pack(side="left",padx=2)
         for text,command in (("Import Excel",self.import_sales_excel),("Import PDF",self.import_sales_pdf)):
             tk.Button(toolbar,text=text,command=command,bg=GOLD,fg=NAVY,border=0,padx=10,pady=4).pack(side="left",padx=(8 if text=="Import Excel" else 2,2))
-        self.action_button(toolbar,"AI Read PDF",self.ai_read_sales_pdf).pack(side="left",padx=2)
+        self.action_button(toolbar,"Free PDF Read",self.ai_read_sales_pdf).pack(side="left",padx=2)
         # Totals bar is pinned to the very bottom of the tab FIRST, so it can never be pushed off-screen by the table
         bottom=tk.Frame(self.sales_tab,bg=LIGHT); bottom.pack(side="bottom",fill="x",padx=10,pady=(0,4))
         body=tk.Frame(self.sales_tab,bg=LIGHT); body.pack(side="top",fill="both",expand=True,padx=10,pady=(2,4))
@@ -1535,7 +1562,13 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         item["_iid"]=iid; self.update_sales_totals()
         if not item["description"]:
             self.sales_sheet.selection_set(iid); self.sales_sheet.focus(iid)
-            self.after(50,lambda:self.edit_sales_cell(column_index=1 if not getattr(self,"inventory_rows",None) else 0,iid=iid))
+            sheet = self.sales_sheet
+            def edit_new_line():
+                # A callback from a closed company/page must not rebuild its controls
+                # or steal focus. Optional inventory data must not load every tab.
+                if self.__dict__.get("sales_sheet") is sheet and sheet.winfo_exists() and sheet.winfo_ismapped():
+                    self.edit_sales_cell(column_index=1 if not self.__dict__.get("inventory_rows") else 0,iid=iid)
+            self.after(50,edit_new_line)
         return iid
 
     def sales_item_for(self,iid):
@@ -1984,8 +2017,8 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         self.action_button(employee_actions,"New Employee",lambda:self.employee_dialog()).pack(side="left",padx=4)
         self.action_button(employee_actions,"Edit Selected",self.edit_selected_employee).pack(side="left",padx=4)
         self.action_button(employee_actions,"R3 Registration Worksheet",lambda:self.employee_r3_worksheet("preview")).pack(side="left",padx=4)
-        self.action_button(employee_actions,"R3 PDF",lambda:self.employee_r3_worksheet("pdf")).pack(side="left",padx=4)
-        self.action_button(employee_actions,"R3 Excel",lambda:self.employee_r3_worksheet("xlsx")).pack(side="left",padx=4)
+        self.action_button(employee_actions,"R3-1 Worksheet",lambda:self.employee_r3_worksheet("preview","R3-1")).pack(side="left",padx=4)
+        
         self.action_button(employee_actions,"Official R3 Form",lambda:self.download_payroll_form("R3")).pack(side="left",padx=4)
         self.action_button(employee_actions,"Official R3-1 Form",lambda:self.download_payroll_form("R3-1")).pack(side="left",padx=4)
         nssf_forms=tk.Frame(employees,bg=LIGHT); nssf_forms.pack(fill="x",padx=10,pady=(0,5))
@@ -2033,7 +2066,10 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         self.payroll_notes=tk.Label(form,text="",bg=LIGHT,fg="#8B1E1E",anchor="w",justify="left",font=("Segoe UI",9,"bold"),wraplength=1060); self.payroll_notes.grid(row=7,column=0,columnspan=8,padx=6,sticky="w")
         self.payroll_result=tk.StringVar(value="Gross: 0 | Tax: 0 | Employee NSSF: 0 | Net: 0")
         tk.Label(form,textvariable=self.payroll_result,bg=LIGHT,fg=NAVY,font=("Segoe UI",10,"bold"),wraplength=1000,justify="left").grid(row=5,column=0,columnspan=8,padx=6,pady=6,sticky="w")
+        for variable in (self.payroll_employee,self.payroll_period,*self.payroll_vars.values(),self.payroll_transport_days):
+            variable.trace_add("write",self.mark_payroll_stale)
         buttons=tk.Frame(form,bg=LIGHT); buttons.grid(row=0,column=4,columnspan=4,sticky="w",padx=6)
+        self.action_button(buttons,"Schooling Law",self.schooling_law_dialog).pack(side="left",padx=3)
         self.action_button(buttons,"Calculate",self.calculate_payroll).pack(side="left",padx=3)
         tk.Button(buttons,text="Save Payroll",command=self.save_payroll,bg=GOLD,fg=NAVY,border=0,padx=15,pady=7,font=("Segoe UI",9,"bold")).pack(side="left",padx=3)
         payroll_actions=tk.Frame(run,bg=LIGHT); payroll_actions.pack(fill="x",padx=10)
@@ -2041,9 +2077,11 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         self.payroll_tree=self.table(run,[("number","Payroll No.",135),("period","Period",95),("employee","Employee",190),("currency","Currency",65),
             ("gross","Gross",105),("tax","Tax",95),("nssf","Employee NSSF",110),("net","Net Salary",110),("status","Status",75)])
         self.payroll_setting_vars={key:tk.StringVar() for key in ("date_from","date_to","single_allowance","spouse_allowance","child_allowance","employee_nssf_rate","medical_rate","end_service_rate","family_rate","employee_ceiling","medical_ceiling","family_ceiling","end_service_ceiling","salary_account","salary_payable_account","payroll_tax_account","nssf_payable_account",
-            "max_children_deduction","transport_daily_exempt","default_transport_days","schooling_annual_exempt","schooling_max_children","tax_rounding","minimum_wage","family_allowance_spouse","family_allowance_child","family_allowance_cap","family_allowance_max_children")}
+            "max_children_deduction","transport_daily_exempt","default_transport_days","schooling_annual_exempt","schooling_max_children","schooling_public_child","schooling_public_cap","schooling_private_child","schooling_private_cap","tax_rounding","minimum_wage","family_allowance_spouse","family_allowance_child","family_allowance_cap","family_allowance_max_children")}
         setting_labels=(("date_from","Date From"),("date_to","Date To"),("single_allowance","Single Allowance"),("spouse_allowance","Spouse Allowance"),("child_allowance","Child Allowance"),("employee_nssf_rate","Employee NSSF Rate"),("medical_rate","Employer Medical Rate"),("end_service_rate","End Service Rate"),("family_rate","Family Rate"),("employee_ceiling","Employee NSSF Ceiling"),("medical_ceiling","Medical Ceiling"),("family_ceiling","Family Ceiling"),("end_service_ceiling","End Service Ceiling"),("salary_account","Salary Expense Account"),("salary_payable_account","Salary Payable Account"),("payroll_tax_account","Payroll Tax Account"),("nssf_payable_account","NSSF Payable Account"),
-            ("max_children_deduction","Tax Deduction Children"),("transport_daily_exempt","Transport Exempt / Day"),("default_transport_days","Default Transport Days"),("schooling_annual_exempt","Schooling Exempt / Year"),("schooling_max_children","Schooling Children"),
+            ("max_children_deduction","Tax Deduction Children"),("transport_daily_exempt","Transport Exempt / Day"),("default_transport_days","Default Transport Days"),("schooling_annual_exempt","Schooling Tax Exempt / Year"),("schooling_max_children","Schooling Children"),
+            ("schooling_public_child","Public School / Child"),("schooling_public_cap","Public School Cap"),
+            ("schooling_private_child","Private School / Child"),("schooling_private_cap","Private School Cap"),
             ("tax_rounding","Round Tax Up To"),("minimum_wage","Minimum Wage"),("family_allowance_spouse","Allowance Spouse"),("family_allowance_child","Allowance per Child"),("family_allowance_cap","Allowance Maximum"),("family_allowance_max_children","Allowance Children"))
         for index,(key,label) in enumerate(setting_labels):
             column=(index//10)*2; row=index%10
@@ -2099,7 +2137,44 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         employee=next((row for row in getattr(self,"employee_rows",[]) if str(row["id"])==str(selected[0])),None)
         if employee: self.employee_dialog(employee)
 
-    def employee_r3_worksheet(self,format_name):
+    def edit_employee_form(self,title,meta,sections,filename):
+        """Review company/employee values and edit the prepared form before export."""
+        dialog=tk.Toplevel(self)
+        dialog.title(title); dialog.geometry("780x680"); dialog.transient(self)
+        canvas=tk.Canvas(dialog,bg=LIGHT,highlightthickness=0)
+        scrollbar=ttk.Scrollbar(dialog,orient="vertical",command=canvas.yview)
+        body=tk.Frame(canvas,bg=LIGHT)
+        body.bind("<Configure>",lambda _event:canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0,0),window=body,anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left",fill="both",expand=True)
+        scrollbar.pack(side="right",fill="y")
+        variables=[]
+        for section in sections:
+            tk.Label(body,text=section["heading"],bg=LIGHT,fg=NAVY,
+                     font=("Segoe UI",11,"bold")).pack(anchor="w",padx=12,pady=(12,5))
+            for label,value in section["rows"]:
+                line=tk.Frame(body,bg=LIGHT); line.pack(fill="x",padx=12,pady=2)
+                tk.Label(line,text=label,bg=LIGHT,width=27,anchor="w").pack(side="left")
+                variable=tk.StringVar(value="" if value=="MISSING" else str(value or ""))
+                tk.Entry(line,textvariable=variable,width=58).pack(side="left",fill="x",expand=True)
+                variables.append((section["heading"],label,variable))
+        actions=tk.Frame(body,bg=LIGHT); actions.pack(fill="x",padx=12,pady=15)
+        def export(kind):
+            prepared=[]
+            for section in sections:
+                rows=[[label,(var.get().strip() or "MISSING")]
+                      for heading,label,var in variables if heading==section["heading"]]
+                prepared.append({**section,"rows":rows})
+            missing=[label for _,label,var in variables if not var.get().strip()]
+            notes=[line for line in meta if not line.startswith("Missing in the company or employee file:")]
+            if missing: notes.append("Missing fields: "+", ".join(missing))
+            self.output_sections(title,notes,prepared,filename,kind)
+        for label,kind in (("Preview","preview"),("Save PDF","pdf"),("Save Excel","xlsx")):
+            self.action_button(actions,label,lambda value=kind:export(value)).pack(side="left",padx=4)
+        self.action_button(actions,"Close",dialog.destroy).pack(side="left",padx=4)
+
+    def employee_r3_worksheet(self,format_name,form="R3"):
         selected=self.employee_tree.selection()
         if not selected: return messagebox.showwarning("R3 Registration","Select an employee first")
         employee=next((row for row in getattr(self,"employee_rows",[]) if str(row["id"])==str(selected[0])),None)
@@ -2118,14 +2193,14 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         missing=[label for (label,key),row in zip(fields,rows) if row[1]=="MISSING"]
         missing+=[label for label,row in zip(("Employer / company","Employer address","Employer phone","MOF / VAT number","NSSF employer number"),employer_rows) if row[1]=="MISSING"]
         meta=[f'Employee ID: {employee["employee_number"]}',
-              "Preparation worksheet only. Complete and submit the Ministry of Finance R3 / R3-1 form separately.",
-              "Official form: https://eservices.finance.gov.lb/Resources/Namazej/DASS1/%D8%B13.pdf",
+              f"Preparation worksheet only. Complete and submit the Ministry of Finance {form} form separately.",
+              "Official form: " + ("https://eservices.finance.gov.lb/Resources/Namazej/DASS1/%D8%B13.pdf" if form=="R3" else "https://www.finance.gov.lb/en-us/Taxation/Na/DASS1/%D8%B13-1.pdf"),
               "Check the official form for other details and supporting documents."]
         if missing: meta.append("Missing in the company or employee file: " + ", ".join(missing))
-        self.output_sections("R3 Employee Registration Worksheet",meta,
+        self.edit_employee_form(f"{form} Employee Registration Worksheet",meta,
             [{"heading":"Employer information","headers":["Field","Value"],"rows":employer_rows,"total_rows":[]},
              {"heading":"Employee information","headers":["Field","Value"],"rows":rows,"total_rows":[]}],
-            f'R3_Worksheet_{employee["employee_number"]}',format_name)
+            f'{form}_Worksheet_{employee["employee_number"]}')
 
     def employee_nssf_declaration(self,kind,format_name):
         titles={"hire":("NSSF Employment Declaration","NSSF Employment Declaration (Estekhdam Ajir) Worksheet | \u0625\u0639\u0644\u0627\u0645 \u0627\u0633\u062a\u062e\u062f\u0627\u0645 \u0623\u062c\u064a\u0631","NSSF-HIRE-NEW","hire_date","Start date"),
@@ -2153,10 +2228,10 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
               "Download the official blank form from the NSSF employee forms buttons."]
         if kind=="leave" and (employee.get("leave_date") in (None,"")): meta.append("No leaving date on file - set it in the employee file before you file the termination.")
         if missing: meta.append("Missing in the company or employee file: " + ", ".join(missing))
-        self.output_sections(title,meta,
+        self.edit_employee_form(title,meta,
             [{"heading":"Employer information","headers":["Field","Value"],"rows":employer_rows,"total_rows":[]},
              {"heading":"Employee information","headers":["Field","Value"],"rows":rows,"total_rows":[]}],
-            f'NSSF_{kind}_Worksheet_{employee["employee_number"]}',format_name)
+            f'NSSF_{kind}_Worksheet_{employee["employee_number"]}')
 
     def download_payroll_form(self,form):
         official={"R3":"https://eservices.finance.gov.lb/Resources/Namazej/DASS1/%D8%B13.pdf",
@@ -2192,6 +2267,47 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         if not self.payroll_employee.get() and self.payroll_employee_map: self.payroll_employee.set(next(iter(self.payroll_employee_map))); self.payroll_employee_chosen()
         self.payroll_tree.delete(*self.payroll_tree.get_children())
         for row in payroll: self.payroll_tree.insert("","end",iid=str(row["id"]),values=(row["payroll_number"],safe_display_date(row["period_date"]),row["full_name"],row["currency"],f'{float(row["gross_salary"]):,.2f}',f'{float(row["income_tax"]):,.2f}',f'{float(row["employee_nssf"]):,.2f}',f'{float(row["net_salary"]):,.2f}',row["status"]))
+
+    def schooling_law_dialog(self):
+        """Calculate the annual schooling grant under the dated public/private rules."""
+        employee=getattr(self,"payroll_employee_map",{}).get(self.payroll_employee.get())
+        if not employee: return messagebox.showwarning("Schooling","Select an employee first")
+        try:
+            period=formatted_user_date(self.payroll_period.get())
+            rules=self.client.payroll_settings(period)
+        except Exception as exc: return messagebox.showerror("Schooling",str(exc))
+        public=tk.StringVar(value="0"); private=tk.StringVar(value="0")
+        window=tk.Toplevel(self); window.title("Annual Schooling Grant"); window.transient(self)
+        window.configure(bg=LIGHT); window.geometry("500x280")
+        tk.Label(window,text=f"Schooling rules from {safe_display_date(rules.get('schooling_rules_date') or rules.get('date_from'))}  |  {employee['full_name']}",
+            bg=LIGHT,fg=NAVY,font=("Segoe UI",10,"bold")).pack(anchor="w",padx=12,pady=10)
+        for label,var in (("Public / free school or Lebanese University children",public),
+                          ("Private school / university children",private)):
+            line=tk.Frame(window,bg=LIGHT); line.pack(fill="x",padx=12,pady=4)
+            tk.Label(line,text=label,bg=LIGHT,width=43,anchor="w").pack(side="left")
+            tk.Entry(line,textvariable=var,width=5).pack(side="left")
+        rates=(Decimal(str(rules.get("schooling_public_child") or 0)),Decimal(str(rules.get("schooling_public_cap") or 0)),
+               Decimal(str(rules.get("schooling_private_child") or 0)),Decimal(str(rules.get("schooling_private_cap") or 0)))
+        tk.Label(window,text=f"Public: {rates[0]:,.0f} / child (cap {rates[1]:,.0f})  |  Private: {rates[2]:,.0f} / child (cap {rates[3]:,.0f}) LBP",
+            bg=LIGHT,fg=NAVY,wraplength=470).pack(anchor="w",padx=12,pady=8)
+        tk.Label(window,text="Annual grant, paid once for the school year. Check supporting documents and prior payments. Tax-exempt amount is a separate setting.",
+            bg=LIGHT,fg="#8B1E1E",wraplength=470,justify="left").pack(anchor="w",padx=12,pady=5)
+        def apply():
+            try:
+                counts=[int(public.get()),int(private.get())]
+                if any(value<0 for value in counts) or sum(counts)>min(3,int(employee.get("children") or 0)):
+                    raise ValueError("Enter up to 3 eligible children, within the employee's recorded child count")
+                if not any(rates): raise ValueError("No schooling grant rule is loaded for this period")
+                amount=min(Decimal(counts[0])*rates[0],rates[1])+min(Decimal(counts[1])*rates[2],rates[3])
+                currency=employee.get("currency") or "LBP"
+                if currency!="LBP":
+                    rate=Decimal(str(self.client.suggested_rates(currency,period)["rate_lbp"]))
+                    if rate<=0: raise ValueError("Set the currency exchange rate first")
+                    amount=(amount/rate).quantize(Decimal("0.01"))
+                self.payroll_vars["schooling"].set(str(amount))
+                window.destroy()
+            except Exception as exc: messagebox.showerror("Schooling",str(exc),parent=window)
+        self.action_button(window,"Use Amount in Payroll",apply).pack(anchor="w",padx=12,pady=8)
 
     def payroll_employee_chosen(self):
         employee=getattr(self,"payroll_employee_map",{}).get(self.payroll_employee.get())
@@ -2231,6 +2347,12 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         amount=daily*days/rate
         self.payroll_vars["transport"].set(f"{amount:.0f}" if currency=="LBP" else f"{amount.quantize(Decimal('0.01'))}")
 
+    def mark_payroll_stale(self,*_args):
+        if hasattr(self,"payroll_result"):
+            self.payroll_result.set("Inputs changed - click Calculate for the current tax and net salary")
+        if hasattr(self,"payroll_breakdown"): self.payroll_breakdown.config(text="")
+        if hasattr(self,"payroll_notes"): self.payroll_notes.config(text="")
+
     def payroll_payload(self):
         employee=self.payroll_employee_map.get(self.payroll_employee.get())
         if not employee: raise ValueError("Select an employee")
@@ -2246,19 +2368,27 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
 
     def calculate_payroll(self):
         try: result=self.client.calculate_payroll(self.payroll_payload())
-        except Exception as exc: return messagebox.showerror("Payroll",str(exc))
+        except Exception as exc:
+            messagebox.showerror("Payroll",str(exc))
+            return None
         if not getattr(self,"_family_manual",False) and hasattr(self,"payroll_family_override"):
             value=float(result.get("family_allowance") or 0)
             self.payroll_family_override.set(f"{value:.0f}" if result.get("currency")=="LBP" else f"{value:.2f}")
         retro=f' (of which retro tax {result["retro_tax"]:,.2f})' if result.get("retro_tax") else ""
         rules=result.get("settings_period") or {}
         period=f' | Rules from {safe_display_date(rules["date_from"])}' if rules.get("date_from") else ""
-        self.payroll_breakdown.config(text=f'Tax: regular {result.get("regular_tax",0):,.2f} + bonus/13th {result.get("one_off_tax",0):,.2f} + retro {result.get("retro_tax",0):,.2f}   |   Exempt: transport {result.get("exempt_transport",0):,.2f} ({result.get("transport_days","")} days), schooling {result.get("exempt_schooling",0):,.2f}   |   NSSF family allowance paid: {result.get("family_allowance",0):,.2f} {result["currency"]}')
+        self.payroll_breakdown.config(text=f'Worked {result.get("worked_days","?")}/{result.get("calendar_days","?")} days | Tax: regular {result.get("regular_tax",0):,.2f} + bonus/13th {result.get("one_off_tax",0):,.2f} + retro {result.get("retro_tax",0):,.2f}   |   Exempt: transport {result.get("exempt_transport",0):,.2f} ({result.get("transport_days","")} days), schooling {result.get("exempt_schooling",0):,.2f}   |   NSSF family allowance paid: {result.get("family_allowance",0):,.2f} {result["currency"]}')
+        tax_detail=(f"Annualized recurring {result.get('annualized_recurring_lbp',0):,.0f} LBP"
+                    f" - family deduction {result.get('family_deduction_lbp',0):,.0f} LBP"
+                    f" = taxable {result.get('annualized_taxable_lbp',0):,.0f} LBP")
+        self.payroll_breakdown.config(text=self.payroll_breakdown.cget("text")+"  |  "+tax_detail)
         self.payroll_notes.config(text=("Check: "+"  |  ".join(result.get("compliance_notes") or [])) if result.get("compliance_notes") else "Compliant with the rules of this period")
         self.payroll_notes.config(fg="#8B1E1E" if result.get("compliance_notes") else NAVY)
         self.payroll_result.set(f'Gross: {result["gross_salary"]:,.2f} | Tax: {result["income_tax"]:,.2f} {result["currency"]} ({result["income_tax_lbp"]:,.0f} LBP){retro} | Employee NSSF: {result["employee_nssf"]:,.2f} | Employer NSSF: {result["employer_medical"]+result["employer_family"]+result["employer_end_service"]:,.2f} | Net: {result["net_salary"]:,.2f}{period}')
+        return result
 
     def save_payroll(self):
+        if self.calculate_payroll() is None: return
         try: saved=self.client.save_payroll(self.payroll_payload())
         except Exception as exc: return messagebox.showerror("Payroll",str(exc))
         self.load_payroll(); messagebox.showinfo("Payroll",f'Payroll {saved["payroll_number"]} saved as draft')
