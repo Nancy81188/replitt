@@ -191,6 +191,30 @@ class OcrPageTests(unittest.TestCase):
         self.assertEqual((parsed["subtotal"], parsed["vat"], parsed["total"]),
                          (1000.0, 110.0, 1110.0))
 
+    def test_reference_date_and_tax_summary_survive_scan_format(self):
+        text = (
+            "Ref NB# ECO-22-24\nDate: 26-Jun-24\n"
+            "Total $ 25,120.00\nVAT 11% $ 2,763.20\n"
+            "Grand Total $ 27,883.20\n"
+            "Bank Account Currency: LBP"
+        )
+
+        parsed = _parse_invoice_text("variation-order.pdf", text)
+
+        self.assertEqual(parsed["invoice_number"], "ECO-22-24")
+        self.assertEqual(parsed["invoice_date"], "26-06-2024")
+        self.assertEqual(parsed["currency"], "USD")
+        self.assertEqual((parsed["subtotal"], parsed["vat"], parsed["total"]),
+                         (25120.0, 2763.2, 27883.2))
+        self.assertIn("document reference suggested", parsed["notes"].casefold())
+
+    def test_unlabelled_total_is_not_subtotal_without_vat_grand_total_sequence(self):
+        text = "Invoice No: INV-44\nDate: 27/06/2024\nTotal: 100.00\nGrand Total: 111.00"
+
+        parsed = _parse_invoice_text("invoice.pdf", text)
+
+        self.assertIsNone(parsed["subtotal"])
+
     def test_arabic_amount_label_variants_and_rtl_number_first_rows(self):
         text = ("فاتورة رقم 45\nالتاريخ 15/03/2026\n"
                 "١٬٢٠٠٫٥٠ : الإجمالي قبل الضريبة\n"
@@ -283,6 +307,32 @@ class OcrPageTests(unittest.TestCase):
         self.assertEqual((results[0]["invoice_number"], results[0]["total"]), ("46", 222.0))
         self.assertTrue(results[0]["ocr_used"])
         self.assertIn("Local OCR suggestion", results[0]["notes"])
+
+    def test_multi_page_reader_keeps_reference_warning_after_ocr_refresh(self):
+        fake_pypdf = types.ModuleType("pypdf")
+
+        class WeakTextPage:
+            def extract_text(self):
+                return "Supplier address and bank details with no recognized total."
+
+        fake_pypdf.PdfReader = lambda _path: types.SimpleNamespace(pages=[WeakTextPage()])
+        extracted = (
+            "Ref NB# ECO-22-24\nDate: 26-Jun-24\n"
+            "Total $ 25,120.00\nVAT 11% $ 2,763.20\n"
+            "Grand Total $ 27,883.20\nBank Account Currency: LBP"
+        )
+        with patch.dict(sys.modules, {"pypdf": fake_pypdf}), patch(
+                "pdf_import._ocr_pdf_pages", return_value=[extracted]):
+            results = read_invoice_pdf_pages(Path("variation-order.pdf"))
+
+        self.assertEqual(len(results), 1)
+        row = results[0]
+        self.assertEqual((row["invoice_number"], row["invoice_date"]),
+                         ("ECO-22-24", "26-06-2024"))
+        self.assertEqual(row["currency"], "USD")
+        self.assertEqual((row["subtotal"], row["vat"], row["total"]),
+                         (25120.0, 2763.2, 27883.2))
+        self.assertIn("document reference suggested", row["notes"].casefold())
 
     def test_inconsistent_ocr_vat_is_flagged_before_review(self):
         extracted = ("Invoice No: 45\nDate: 15/03/2026\nSupplier Co\n"
