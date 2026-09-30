@@ -849,7 +849,7 @@ def run_server(host="127.0.0.1", port=8765, database="saber_accounting.db", admi
         raise ValueError("Shared network access requires --tls-cert and --tls-key (or explicit --allow-insecure-lan for a trusted VPN)")
     admin_password = admin_password or os.environ.get("SABER_ADMIN_PASSWORD") or secrets.token_urlsafe(12)
     db = Database(database, pooled=True)
-    db.initialize(admin_password)
+    db.initialize_if_needed(admin_password)
     ApiHandler.db = db; ApiHandler.master_db=db; ApiHandler.company_manager=CompanyManager(database, pooled=True)
     # Company data lives in companies/<Company Name>/<Company Name>_<year>.db (moved there once, safely).
     try:
