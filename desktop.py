@@ -8,9 +8,10 @@ import traceback
 import mimetypes
 import time
 import json
+import uuid
 from urllib.request import urlopen
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -63,6 +64,14 @@ def sortable_date(value):
         except ValueError: pass
     return datetime.min
 
+def initial_window_size(screen_width, screen_height, dpi_scale=1.0):
+    """Keep the initial window and its minimum size inside compact displays."""
+    available_width=max(1,screen_width-32)
+    available_height=max(1,screen_height-72)
+    width=min(round(1180*dpi_scale),available_width)
+    height=min(round(720*dpi_scale),available_height)
+    return width,height,min(round(760*dpi_scale),width),min(round(480*dpi_scale),height)
+
 def parse_user_date(value):
     text=str(value or "").strip()
     for pattern in ("%d-%m-%Y","%d%m%Y","%Y-%m-%d","%Y%m%d"):
@@ -101,8 +110,9 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         screen_width, screen_height = self.winfo_screenwidth(), self.winfo_screenheight()
         try: dpi_scale=max(1.0,min(2.0,self.winfo_fpixels("1i")/96.0))
         except tk.TclError: dpi_scale=1.0
-        self.geometry(f"{min(round(1180*dpi_scale), screen_width)}x{min(round(720*dpi_scale), screen_height)}")
-        self.minsize(min(round(760*dpi_scale), screen_width), min(round(480*dpi_scale), screen_height))
+        width,height,min_width,min_height=initial_window_size(screen_width,screen_height,dpi_scale)
+        self.geometry(f"{width}x{height}")
+        self.minsize(min_width,min_height)
         if sys.platform == "win32":
             try: self.state("zoomed")
             except tk.TclError: pass
@@ -336,7 +346,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         """Customers / suppliers search whose choice is written into any field."""
         try: parties = self.client.parties()
         except Exception as exc: return messagebox.showerror("Customers / Suppliers", str(exc))
-        window = tk.Toplevel(self); window.title("Customers / Suppliers - Search"); window.geometry("700x420"); window.configure(bg=LIGHT); window.transient(self); window.grab_set()
+        window = tk.Toplevel(self); window.title("Customers / Suppliers - Search"); self.fit_dialog(window,700,420); window.configure(bg=LIGHT); window.transient(self); window.grab_set()
         search = tk.StringVar(); entry = tk.Entry(window, textvariable=search, width=40); entry.pack(padx=10, pady=8); entry.focus_set()
         tree = ttk.Treeview(window, columns=("name", "account", "kind", "currency"), show="headings"); tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         for key, label, width in (("name", "Name", 300), ("account", "Account", 110), ("kind", "Type", 90), ("currency", "Currency", 70)): tree.heading(key, text=label); tree.column(key, width=width)
@@ -515,10 +525,12 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         self.status_bar()
         nav_outer=tk.Frame(self,bg=LIGHT); nav_outer.pack(fill="x",padx=8,pady=(4,0))
         nav_canvas=tk.Canvas(nav_outer,bg=LIGHT,highlightthickness=0,height=56)
-        nav_canvas.pack(side="top",fill="x",expand=True)
+        nav_canvas.pack(side="left",fill="x",expand=True)
+        nav_vertical=ttk.Scrollbar(nav_outer,orient="vertical",command=nav_canvas.yview)
+        nav_vertical.pack(side="right",fill="y")
         nav_scroll=ttk.Scrollbar(nav_outer,orient="horizontal",command=nav_canvas.xview)
         nav_scroll.pack(side="bottom",fill="x")
-        nav_canvas.configure(xscrollcommand=nav_scroll.set)
+        nav_canvas.configure(xscrollcommand=nav_scroll.set,yscrollcommand=nav_vertical.set)
         tab_nav=tk.Frame(nav_canvas,bg=LIGHT)
         nav_window=nav_canvas.create_window((0,0),window=tab_nav,anchor="nw")
         nav_buttons=[]; navigation_columns=None
@@ -536,7 +548,10 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
                 for index,button in enumerate(nav_buttons):
                     button.grid(row=index//columns,column=index%columns,sticky="nsew",padx=4,pady=3)
             nav_canvas.itemconfigure(nav_window,width=max(nav_canvas.winfo_width(),tab_nav.winfo_reqwidth()))
-            nav_canvas.configure(height=max(56,tab_nav.winfo_reqheight()+2),scrollregion=nav_canvas.bbox("all"))
+            nav_canvas.configure(height=min(100,max(56,tab_nav.winfo_reqheight()+2)),scrollregion=nav_canvas.bbox("all"))
+            if tab_nav.winfo_reqheight()>nav_canvas.winfo_height()+1:
+                if not nav_vertical.winfo_manager(): nav_vertical.pack(side="right",fill="y")
+            elif nav_vertical.winfo_manager(): nav_vertical.pack_forget()
             if tab_nav.winfo_reqwidth()>nav_canvas.winfo_width()+1:
                 if not nav_scroll.winfo_manager(): nav_scroll.pack(side="bottom",fill="x")
             elif nav_scroll.winfo_manager(): nav_scroll.pack_forget()
@@ -901,6 +916,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
                   font=("Segoe UI",9,"bold"),border=0,padx=20,pady=7).pack(side="left",padx=4)
         lifecycle=tk.Frame(self.invoices_tab,bg=LIGHT); lifecycle.pack(fill="x",anchor="w",pady=(0,8))
         self.action_button(lifecycle,"Duplicate",self.duplicate_selected_invoice).pack(side="left",padx=4)
+        self.action_button(lifecycle,"Create Return / Credit Note",self.return_selected_invoice).pack(side="left",padx=4)
         tk.Button(lifecycle,text="Cancel Invoice",command=self.cancel_selected_invoice,bg="#8B1E1E",fg="white",border=0,padx=15,pady=7).pack(side="left",padx=4)
         tk.Button(lifecycle,text="Delete Selected",command=self.delete_selected_invoice,bg="#6B1010",fg="white",border=0,padx=15,pady=7).pack(side="left",padx=4)
         self.action_button(lifecycle,"Attach PDF / Image",self.attach_to_selected_invoice).pack(side="left",padx=4)
@@ -933,7 +949,9 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         self.invoice_tree.delete(*self.invoice_tree.get_children())
         for r in rows:
             lbp,usd=self.exchange_equivalents(float(r["total"] or 0),r["currency"],rates)
-            self.invoice_tree.insert("","end",iid=str(r["id"]),values=(r["invoice_number"],"DELETED" if r.get("status")=="deleted" else str(r.get("status") or "").title(),r["invoice_date"],r["party_name"],r.get("branch_name") or "Head Office",r.get("entry_type") or r["kind"],r["currency"],r.get("deductible_subtotal",r["subtotal"]),r.get("non_deductible_subtotal",0),r["total"],r.get("payment_method") or "",r.get("amount_paid") or 0,"" if lbp is None else f"{lbp:,.2f}","" if usd is None else f"{usd:,.2f}",r["debit"],r["credit"],("Yes" if r.get("vat_recoverable",1) else "NO") if r.get("kind")=="purchase" and float(r.get("vat") or 0) else ""),tags=("deleted",) if r.get("status")=="deleted" else ())
+            entry_label=(("Sales" if r.get("kind")=="sale" else "Supplier")+" Credit Note"
+                         if r.get("doc_subtype")=="credit_note" else r.get("entry_type") or r["kind"])
+            self.invoice_tree.insert("","end",iid=str(r["id"]),values=(r["invoice_number"],"DELETED" if r.get("status")=="deleted" else str(r.get("status") or "").title(),r["invoice_date"],r["party_name"],r.get("branch_name") or "Head Office",entry_label,r["currency"],r.get("deductible_subtotal",r["subtotal"]),r.get("non_deductible_subtotal",0),r["total"],r.get("payment_method") or "",r.get("amount_paid") or 0,"" if lbp is None else f"{lbp:,.2f}","" if usd is None else f"{usd:,.2f}",r["debit"],r["credit"],("Yes" if r.get("vat_recoverable",1) else "NO") if r.get("kind")=="purchase" and float(r.get("vat") or 0) else ""),tags=("deleted",) if r.get("status")=="deleted" else ())
         self.invoice_tree.tag_configure("deleted",foreground="#8B1E1E")
 
     def vat_classification_dialog(self):
@@ -1107,6 +1125,91 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
             messagebox.showinfo("Cancel Invoice","Invoice cancelled and reversing journal entry created")
         tk.Button(window,text="Confirm Cancellation",command=confirm,bg="#8B1E1E",fg="white",border=0,padx=18,pady=7).grid(row=1,column=0,columnspan=2,pady=12)
 
+    def return_selected_invoice(self):
+        invoice_id=self.selected_invoice_id()
+        if invoice_id is None: return
+        summary=self.invoice_rows.get(str(invoice_id),{})
+        if summary.get("status")!="posted":
+            return messagebox.showwarning("Return / Credit Note","Only a posted invoice can be returned. Cancellation is a separate action.")
+        if summary.get("doc_subtype")=="credit_note":
+            return messagebox.showwarning("Return / Credit Note","A credit note cannot itself be returned.")
+        try: detail=self.client.invoice_detail(invoice_id)
+        except Exception as exc: return messagebox.showerror("Return / Credit Note",str(exc))
+        invoice=detail["invoice"]; items=detail.get("items") or []
+        return_request_id=str(uuid.uuid4())
+        if not items:
+            return messagebox.showwarning("Return / Credit Note","This invoice has no item lines, so a quantity-reviewed return cannot be safely created.")
+        is_sale=invoice.get("kind")=="sale"; title="Sales Return / Credit Note" if is_sale else "Purchase Return / Supplier Credit Note"
+        window=tk.Toplevel(self); window.title(title); window.configure(bg=LIGHT); window.transient(self); window.grab_set()
+        tk.Label(window,text=f"Return against {invoice['invoice_number']} — {invoice.get('party_name') or ''}",
+                 bg=LIGHT,font=("Segoe UI",10,"bold")).pack(anchor="w",padx=12,pady=(12,4))
+        tk.Label(window,text="Enter quantities to return. Value and VAT are calculated proportionally from the posted lines.\n"
+                 "This creates a linked credit note only; it does not refund cash or allocate a payment.",
+                 bg=LIGHT,fg="#5f6b76",justify="left").pack(anchor="w",padx=12,pady=(0,8))
+        date_line=tk.Frame(window,bg=LIGHT); date_line.pack(anchor="w",padx=12,pady=4)
+        tk.Label(date_line,text="Return date (DD-MM-YYYY)",bg=LIGHT).pack(side="left")
+        date_var=tk.StringVar(value=self.fiscal_today()); tk.Entry(date_line,textvariable=date_var,width=14).pack(side="left",padx=7)
+        grid=tk.Frame(window,bg=LIGHT); grid.pack(fill="both",expand=True,padx=12,pady=6)
+        for col,label in enumerate(("Description","Original Qty","Returned","Available","Return Qty","Line incl. VAT")):
+            tk.Label(grid,text=label,bg=NAVY,fg="white",padx=5,pady=4).grid(row=0,column=col,sticky="ew")
+        qty_vars={}
+        def preview_value(record,qty,available):
+            if not available: return 0.0
+            ratio=Decimal(str(qty))/Decimal(str(available)); cent=Decimal("0.01")
+            fields=(("deductible_subtotal","returned_deductible_subtotal"),
+                    ("non_deductible_subtotal","returned_non_deductible_subtotal"),("vat","returned_vat"))
+            return float(sum(((Decimal(str(record.get(source) or 0))-Decimal(str(record.get(returned) or 0)))*ratio)
+                             .quantize(cent,rounding=ROUND_HALF_UP) for source,returned in fields))
+        for index,line in enumerate(items,1):
+            original=float(line.get("quantity") or 0); already=float(line.get("returned_quantity") or 0); available=max(0,original-already)
+            tk.Label(grid,text=line["description"],bg=LIGHT,anchor="w").grid(row=index,column=0,sticky="w",padx=4,pady=3)
+            for col,value in ((1,original),(2,already),(3,available)):
+                tk.Label(grid,text=f"{value:g}",bg=LIGHT).grid(row=index,column=col,padx=4,pady=3)
+            var=tk.StringVar(value="0"); qty_vars[int(line["id"])]=(var,line,available)
+            entry=tk.Entry(grid,textvariable=var,width=10,justify="right"); entry.grid(row=index,column=4,padx=4,pady=3)
+            amount=tk.StringVar(value="0.00")
+            tk.Label(grid,textvariable=amount,bg=LIGHT,anchor="e").grid(row=index,column=5,sticky="e",padx=4,pady=3)
+            def update_amount(*_args,v=var,record=line,limit=available,out=amount):
+                try:
+                    qty=float(v.get() or 0)
+                    if qty<0 or qty>limit: raise ValueError
+                    out.set(f"{preview_value(record,qty,limit):,.2f}")
+                except (ValueError,ZeroDivisionError): out.set("Review quantity")
+            var.trace_add("write",update_amount)
+        total_label=tk.StringVar(value="Total credit note: 0.00 "+str(invoice.get("currency") or ""))
+        tk.Label(window,textvariable=total_label,bg=LIGHT,fg=NAVY,font=("Segoe UI",10,"bold")).pack(anchor="e",padx=16,pady=4)
+        def update_total(*_args):
+            try:
+                total=0.0
+                for var,line,available in qty_vars.values():
+                    qty=float(var.get() or 0)
+                    if qty<0 or qty>available: raise ValueError
+                    total+=preview_value(line,qty,available)
+                total_label.set(f"Total credit note: {total:,.2f} {invoice.get('currency') or ''}")
+            except (ValueError,ZeroDivisionError): total_label.set("Correct quantities to see the credit-note total")
+        for var,_,_ in qty_vars.values(): var.trace_add("write",update_total)
+        def save_return():
+            try:
+                parsed_date=formatted_user_date(date_var.get().strip())
+                selections=[]
+                for item_id,(var,line,available) in qty_vars.items():
+                    value=float(var.get().replace(",","") or 0)
+                    if value<0 or value>available: raise ValueError(f"{line['description']}: quantity must be from 0 to {available:g}")
+                    if value: selections.append({"item_id":item_id,"quantity":str(value)})
+                if not selections: raise ValueError("Enter at least one quantity to return")
+                if not messagebox.askyesno(title,f"Post the reviewed return against {invoice['invoice_number']}?\n"
+                        "A credit note and any applicable stock reversal will be created. No cash refund or payment allocation is created.",parent=window):
+                    return
+                created=self.client.create_invoice_return(invoice_id,selections,parsed_date,return_request_id)
+            except Exception as exc:
+                return messagebox.showerror(title,str(exc),parent=window)
+            window.destroy(); self.load_invoices(); self.load_dashboard(); self.load_journal(); self.load_trial()
+            messagebox.showinfo(title,f"Posted {created['invoice_number']} linked to {invoice['invoice_number']}. "
+                              "No cash refund or allocation was created.")
+        buttons=tk.Frame(window,bg=LIGHT); buttons.pack(pady=10)
+        tk.Button(buttons,text="Post Return / Credit Note",command=save_return,bg=NAVY,fg="white",border=0,padx=16,pady=7).pack(side="left",padx=4)
+        tk.Button(buttons,text="Cancel",command=window.destroy,bg="#5f6b76",fg="white",border=0,padx=16,pady=7).pack(side="left",padx=4)
+
     def attach_to_selected_invoice(self):
         invoice_id=self.selected_invoice_id()
         if invoice_id is None: return
@@ -1125,7 +1228,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         try: items=self.client.attachments(invoice_id)
         except Exception as exc: return messagebox.showerror("Attachments",str(exc))
         if not items: return messagebox.showinfo("Attachments","This invoice has no attachments")
-        window=tk.Toplevel(self); window.title("Invoice Attachments"); window.geometry("620x340")
+        window=tk.Toplevel(self); window.title("Invoice Attachments"); self.fit_dialog(window,620,340)
         tree=ttk.Treeview(window,columns=("name","type","size","date"),show="headings")
         for key,label,width in (("name","File Name",240),("type","Type",140),("size","Size",80),("date","Uploaded",140)):
             tree.heading(key,text=label); tree.column(key,width=width)
@@ -1147,7 +1250,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         if invoice_id is None: return
         try: items=self.client.invoice_history(invoice_id)
         except Exception as exc: return messagebox.showerror("History",str(exc))
-        window=tk.Toplevel(self); window.title("Invoice Modification History"); window.geometry("760x380")
+        window=tk.Toplevel(self); window.title("Invoice Modification History"); self.fit_dialog(window,760,380)
         tree=ttk.Treeview(window,columns=("date","user","action","details"),show="headings")
         for key,label,width in (("date","Date",170),("user","User",100),("action","Action",100),("details","Details",370)):
             tree.heading(key,text=label); tree.column(key,width=width)
@@ -1194,6 +1297,8 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
 
     def add_invoice_row(self):
         window=tk.Toplevel(self); window.title("Add Invoice Row"); window.configure(bg=LIGHT); window.transient(self); window.grab_set()
+        self.fit_dialog(window,820,620,480,360)
+        outer,form=self.scrollable_page(window); outer.pack(fill="both",expand=True)
         defaults={"invoice_number":"","invoice_date":datetime.now().strftime("%d-%m-%Y"),"party_name":"",
                   "kind":"purchases","currency":"USD","deductible_subtotal":"0","non_deductible_subtotal":"0","vat":"0","total":"0",
                   "supplier_account":"4011","vat_account":"442660000","expense_account":"601100000",
@@ -1206,14 +1311,14 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
                 ("Due Date (DD-MM-YYYY)","due_date"),("Payment Method","payment_method"),("Paid Amount","amount_paid")]
         for index,(label,key) in enumerate(fields):
             rr=index//2; cc=(index%2)*2
-            tk.Label(window,text=label,bg=LIGHT).grid(row=rr,column=cc,sticky="w",padx=(14,5),pady=7)
-            if key=="kind": widget=ttk.Combobox(window,textvariable=variables[key],values=["assets","expenses","purchases","sales"],state="readonly",width=24)
-            elif key=="currency": widget=ttk.Combobox(window,textvariable=variables[key],values=self.currency_codes,state="readonly",width=24)
-            elif key=="payment_method": widget=ttk.Combobox(window,textvariable=variables[key],values=["Cash","Bank Transfer","Cheque","Card","Other"],state="readonly",width=24)
-            elif key=="branch": widget=self.branch_selector(window,variables[key],24,False)
-            elif key in ("supplier_account","vat_account","expense_account","expense_no_vat_account"): widget=self.account_search_box(window,variables[key],24)
-            elif key in ("invoice_date","due_date"): widget=self.date_entry(window,variables[key],27)
-            else: widget=tk.Entry(window,textvariable=variables[key],width=27)
+            tk.Label(form,text=label,bg=LIGHT).grid(row=rr,column=cc,sticky="w",padx=(14,5),pady=7)
+            if key=="kind": widget=ttk.Combobox(form,textvariable=variables[key],values=["assets","expenses","purchases","sales"],state="readonly",width=24)
+            elif key=="currency": widget=ttk.Combobox(form,textvariable=variables[key],values=self.currency_codes,state="readonly",width=24)
+            elif key=="payment_method": widget=ttk.Combobox(form,textvariable=variables[key],values=["Cash","Bank Transfer","Cheque","Card","Other"],state="readonly",width=24)
+            elif key=="branch": widget=self.branch_selector(form,variables[key],24,False)
+            elif key in ("supplier_account","vat_account","expense_account","expense_no_vat_account"): widget=self.account_search_box(form,variables[key],24)
+            elif key in ("invoice_date","due_date"): widget=self.date_entry(form,variables[key],27)
+            else: widget=tk.Entry(form,textvariable=variables[key],width=27)
             widget.grid(row=rr,column=cc+1,padx=(5,14),pady=7)
         def save():
             values={key:var.get().strip() for key,var in variables.items()}
@@ -1231,12 +1336,12 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
             except Exception as exc: return messagebox.showerror("Invoices",str(exc),parent=window)
             window.destroy(); self.load_invoices(); self.load_dashboard(); self.load_journal(); self.load_trial(); self.load_statement_parties()
             messagebox.showinfo("Invoices","Invoice row added successfully")
-        tk.Button(window,text="Save Invoice",command=save,bg=GOLD,fg=NAVY,font=("Segoe UI",10,"bold"),border=0,padx=24,pady=8).grid(row=9,column=0,columnspan=4,pady=16)
+        tk.Button(form,text="Save Invoice",command=save,bg=GOLD,fg=NAVY,font=("Segoe UI",10,"bold"),border=0,padx=24,pady=8).grid(row=9,column=0,columnspan=4,pady=16)
 
     def add_item_to_selected_invoice(self):
         selected=self.invoice_tree.selection()
         if not selected: return messagebox.showwarning("Invoices","Select one invoice row")
-        invoice_id=int(selected[0]); window=tk.Toplevel(self); window.title("Add Item to Invoice"); window.configure(bg=LIGHT); window.transient(self); window.grab_set()
+        invoice_id=int(selected[0]); window=tk.Toplevel(self); window.title("Add Item to Invoice"); window.configure(bg=LIGHT); window.transient(self); window.grab_set(); self.fit_dialog(window,520,420,360,300)
         defaults={"description":"","quantity":"1","unit_price":"0","subtotal":"0","vat_rate":"11","vat":"0"}
         variables={key:tk.StringVar(value=value) for key,value in defaults.items()}
         fields=[("Description","description"),("Quantity","quantity"),("Unit Price","unit_price"),
@@ -1954,7 +2059,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         selected=self.parties_tree.selection()
         if not selected: return messagebox.showwarning("Legal Documents","Select a customer or supplier first")
         party_id=int(self.parties_tree.item(selected[0],"values")[0]); party_name=self.parties_tree.item(selected[0],"values")[2]
-        window=tk.Toplevel(self); window.title(f"Legal Documents - {party_name}"); window.configure(bg=LIGHT); window.geometry("980x500"); window.transient(self)
+        window=tk.Toplevel(self); window.title(f"Legal Documents - {party_name}"); window.configure(bg=LIGHT); self.fit_dialog(window,980,500); window.transient(self)
         controls=tk.Frame(window,bg=LIGHT); controls.pack(fill="x",padx=8,pady=(8,2))
         doc_type=tk.StringVar(value="MOF / VAT Certificate"); issue=tk.StringVar(); expiry=tk.StringVar(); notes=tk.StringVar(); active=tk.BooleanVar(value=True)
         editing={"id":None}; pending_file={"path":None}
@@ -2145,7 +2250,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
 
     def employee_dialog(self,employee=None):
         window=tk.Toplevel(self); window.title("Employee File"); window.configure(bg=LIGHT); window.transient(self); window.grab_set()
-        window.geometry(f"{min(940,self.winfo_screenwidth())}x{min(650,self.winfo_screenheight()-80)}")
+        self.fit_dialog(window,940,650,480,360)
         outer,form=self.scrollable_page(window); outer.pack(fill="both",expand=True)
         data=employee or {}; fields={key:tk.StringVar(value=str(data.get(key) or "")) for key in ("employee_number","full_name","national_id","mof_number","nssf_number","address","contact_number","nationality","father_name","mother_name","birth_date","birth_place","job_title","hire_date","leave_date","base_salary","salary_account","payable_account")}
         if not fields["employee_number"].get(): fields["employee_number"].set("1000")
@@ -2244,17 +2349,22 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
                   "NSSF-LEAVE":"https://drive.google.com/uc?export=download&id=1_stgCRJwJjdqr2kFLy07ZCwiXDkMdZIy"}
         if form not in official: raise ValueError("Unknown payroll form")
         agency="CNSS" if form.startswith("NSSF") else "MOF"
-        target=filedialog.asksaveasfilename(title=f"Save official {form} form",defaultextension=".pdf",
-            initialfile=f"Lebanon_{agency}_{form}.pdf",filetypes=[("PDF files","*.pdf")])
-        if not target: return
+        import tempfile
+        from pdf_form_editor import open_pdf_form_editor
+        temporary=tempfile.TemporaryDirectory(prefix="saber-official-form-")
+        target=Path(temporary.name)/f"Lebanon_{agency}_{form}.pdf"
         try:
             with urlopen(official[form],timeout=20) as response: content=response.read()
             if not content.startswith(b"%PDF"): raise ValueError(f"The {agency} form link did not return a PDF")
-            Path(target).write_bytes(content)
-        except Exception as exc: return messagebox.showerror(f"Official {form}",f"Could not download the form: {exc}")
-        note=("\nCheck the preprinted rates against the period's NSSF settings before using this blank form."
-              if form in ("NSSF-DUE","NSSF-SETTLEMENT","NSSF-ANNUAL") else "")
-        messagebox.showinfo(f"Official {form}",f"Official blank form saved to {target}{note}")
+            target.write_bytes(content)
+            editor=open_pdf_form_editor(self,target)
+            editor._owned_tempdir=temporary
+        except Exception as exc:
+            temporary.cleanup()
+            return messagebox.showerror(f"Official {form}",f"Could not open the form: {exc}")
+        if form in ("NSSF-DUE","NSSF-SETTLEMENT","NSSF-ANNUAL"):
+            messagebox.showwarning(f"Official {form}",
+                "Check the form's preprinted rates against the applicable NSSF period before filling or printing.")
 
     def load_payroll(self):
         if not hasattr(self,"employee_tree"): return
@@ -2575,7 +2685,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
             rows.append(["","TOTAL",round(sum(r[2] for r in rows),2),round(sum(r[3] for r in rows),2),""])
             sections.append({"heading":f"CLOSING 6&7 - {year} ({currency})   Net result: {info['net_result']:,.2f} {'profit' if info['net_result']>=0 else 'loss'}",
                 "headers":["Account","Account Name",f"Debit ({currency})",f"Credit ({currency})","LBP"],"rows":rows,"total_rows":[len(rows)-1]})
-        window=tk.Toplevel(self); window.title(f"Preview closing {year}"); window.geometry("900x480"); window.configure(bg=LIGHT); window.transient(self)
+        window=tk.Toplevel(self); window.title(f"Preview closing {year}"); self.fit_dialog(window,900,480); window.configure(bg=LIGHT); window.transient(self)
         viewer=self.report_viewer(window); self.show_sections(viewer,sections)
         self.action_button(window,"Close",window.destroy).pack(pady=6)
 
@@ -3204,7 +3314,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         parents={str(row["code"]):row for row in all_accounts if len(str(row.get("code") or ""))==4 and str(row["code"]).isdigit()}
         previous_grab=self.grab_current()
         window=tk.Toplevel(self); window.title("Find or Create Account - F2")
-        window.geometry(f"{min(820,max(320,self.winfo_screenwidth()-40))}x{min(590,max(320,self.winfo_screenheight()-40))}")
+        self.fit_dialog(window,820,590,320,320)
         window.configure(bg=LIGHT); window.transient(previous_grab or self); window.grab_set()
         def close_lookup():
             window.destroy()

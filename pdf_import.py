@@ -267,6 +267,7 @@ def _warn_on_invoice_total_mismatch(result):
         return
     if abs(subtotal + vat - total) > max(0.05, abs(total) * 0.005):
         result["vat"] = None
+        result["acquisition_cost"] = None
         warning = "OCR VAT, subtotal and total do not reconcile; VAT suggestion cleared. Enter and verify the amounts before posting"
         if warning not in result.get("notes", ""):
             result["notes"] = (result.get("notes", "") + "; " + warning).strip("; ")
@@ -294,7 +295,7 @@ def _parse_invoice_text(path, text):
             except ValueError: continue
         if result["invoice_date"]: break
     upper = text.upper()
-    for code, marks in (("LBP", ("LBP", "L.L", "ل.ل", "LL ")), ("EUR", ("EUR", "€")), ("AED", ("AED", "DHS")), ("USD", ("USD", "US$", "$"))):
+    for code, marks in (("LBP", ("LBP", "L.L", "ل.ل", "LL ")), ("EUR", ("EUR", "€")), ("AED", ("AED", "DHS")), ("USD", ("USD", "US$"))):
         if any(mark in upper for mark in marks): result["currency"] = code; break
     result["total"] = _invoice_total_after(text)
     result["vat"] = _vat_amount_after(text)
@@ -304,6 +305,21 @@ def _parse_invoice_text(path, text):
         if len(clean) >= 3 and not re.search(r"invoice|facture|date|tel|phone|page|www|@", clean, re.I) and sum(ch.isalpha() for ch in clean) >= 3:
             result["party_name"] = clean[:60]; break
     result["items"] = _line_items(text)
+    # For a fixed-asset register preview, use a description only when the PDF
+    # yields one unambiguous item (or an explicitly labelled asset/description).
+    if len(result["items"]) == 1:
+        result["asset_name"] = result["items"][0]["description"]
+    else:
+        named = re.search(
+            r"(?im)^\s*(?:asset|item|description|equipment|الموجودات|الأصل|الصنف)\s*[:\-]\s*(.{3,100}?)\s*$",
+            text,
+        )
+        result["asset_name"] = named.group(1).strip() if named else ""
+    # A labelled subtotal is the conservative acquisition-cost candidate.
+    # A grand total is usable only when the PDF explicitly says VAT is zero.
+    result["acquisition_cost"] = result["subtotal"]
+    if result["acquisition_cost"] is None and result["vat"] == 0:
+        result["acquisition_cost"] = result["total"]
     missing = [label for key, label in (("invoice_number", "number"), ("invoice_date", "date"), ("total", "total")) if not result.get(key)]
     result["notes"] = "Read from PDF - please check" + (f"; not found: {', '.join(missing)}" if missing else "")
     if result["vat"] is None and any(re.search(r"\b(?:vat|tva|tax)\b|ض\.ق\.م|ضريبة", line, re.I)
@@ -312,6 +328,24 @@ def _parse_invoice_text(path, text):
     if result["items"]:
         result["notes"] += f"; {len(result['items'])} item row(s) pre-filled for review"
     return result
+
+
+def asset_pdf_details(data):
+    """Return conservative fixed-asset suggestions; absent/ambiguous values stay blank."""
+    date_text = ""
+    raw_date = data.get("invoice_date") or ""
+    for pattern in ("%d-%m-%Y", "%Y-%m-%d", "%d%m%Y"):
+        try:
+            date_text = datetime.strptime(raw_date, pattern).strftime("%d-%m-%Y")
+            break
+        except ValueError:
+            continue
+    return {
+        "name": (data.get("asset_name") or "").strip(),
+        "acquired_on": date_text,
+        "currency": (data.get("currency") or "").upper(),
+        "cost": data.get("acquisition_cost"),
+    }
 
 
 def read_invoice_pdf_pages(path):

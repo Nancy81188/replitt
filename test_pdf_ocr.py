@@ -296,7 +296,7 @@ class OcrPageTests(unittest.TestCase):
         self.assertIn("choose Purchases",screen.import_rows[1]["notes"])
         screen.populate_import_preview.assert_called_once()
 
-    def test_mixed_pdf_types_post_to_their_correct_destinations(self):
+    def test_mixed_pdf_types_route_assets_to_register_review_without_posting(self):
         with tempfile.TemporaryDirectory() as folder:
             pdf=Path(folder)/"invoices.pdf"; pdf.write_bytes(b"%PDF-demo")
             base={"invoice_date":"15-03-2026","party_name":"Supplier","currency":"USD",
@@ -312,19 +312,19 @@ class OcrPageTests(unittest.TestCase):
             screen=types.SimpleNamespace(import_sheet=types.SimpleNamespace(ordered=lambda:rows,clear=Mock()),
                 import_type=types.SimpleNamespace(get=lambda:"Purchases"),import_mode="pdf",
                 import_replace=types.SimpleNamespace(get=lambda:False),client=client)
+            screen.start_import_asset_review=Mock()
             screen.load_dashboard=screen.load_invoices=screen.load_journal=screen.load_trial=screen.load_transactions=Mock()
             with patch("desktop_stage3.messagebox.askyesno",return_value=True) as confirm, \
                  patch("desktop_stage3.messagebox.showinfo") as info, \
                  patch("desktop_stage3.messagebox.showwarning") as warning:
                 Stage3Mixin.send_import(screen)
-            self.assertIn("Purchases: 1",confirm.call_args.args[1])
-            warning.assert_not_called(); info.assert_called_once()
-            invoices=client.import_invoices.call_args.args[0]
-            self.assertEqual([(r["invoice_number"],r["entry_type"]) for r in invoices],
-                             [("GOODS-1","purchases"),("ASSET-1","assets")])
-            self.assertEqual(client.add_expense.call_args.args[0]["payment_account"],"531")
-            self.assertEqual(client.upload_attachment.call_count,2)
-            client.upload_expense_attachment.assert_called_once()
+            self.assertIn("will create one fixed-asset register item",confirm.call_args.args[1])
+            warning.assert_not_called(); info.assert_not_called()
+            screen.start_import_asset_review.assert_called_once_with(rows[1])
+            client.import_invoices.assert_not_called()
+            client.add_expense.assert_not_called()
+            client.upload_attachment.assert_not_called()
+            client.upload_expense_attachment.assert_not_called()
 
     def test_pdf_type_or_paid_account_must_be_chosen_before_posting(self):
         row={"line":"001","invoice_number":"1","invoice_date":"15-03-2026","party_name":"Supplier",
@@ -361,7 +361,7 @@ class OcrPageTests(unittest.TestCase):
         self.assertEqual((row["supplier_account"],row["vat_account"],row["expense_account"]),
                          ("",PURCHASE_VAT,""))
 
-    def test_partial_pdf_import_keeps_failed_rows_and_distinguishes_attachment_failure(self):
+    def test_asset_row_in_partial_import_is_reviewed_before_any_batch_posting(self):
         with tempfile.TemporaryDirectory() as folder:
             pdf=Path(folder)/"invoice.pdf"; pdf.write_bytes(b"%PDF-demo")
             base={"invoice_date":"15-03-2026","party_name":"Supplier","currency":"USD",
@@ -380,16 +380,18 @@ class OcrPageTests(unittest.TestCase):
             screen=types.SimpleNamespace(import_sheet=sheet,import_type=types.SimpleNamespace(get=lambda:"Purchases"),
                 import_mode="pdf",import_replace=types.SimpleNamespace(get=lambda:False),
                 client=client)
+            screen.start_import_asset_review=Mock()
             screen.load_dashboard=screen.load_invoices=screen.load_journal=screen.load_trial=screen.load_transactions=Mock()
             with patch("desktop_stage3.messagebox.askyesno",return_value=True), \
                  patch("desktop_stage3.messagebox.showwarning") as warning:
                 Stage3Mixin.send_import(screen)
-            self.assertEqual(retained,[asset])
-            self.assertEqual(screen.import_rows,[asset])
-            self.assertIn("invoice POSTED (ID 21)",warning.call_args.args[1])
-            self.assertIn("1 unfinished row",warning.call_args.args[1])
-            self.assertIn("invalid account",warning.call_args.args[1])
-            client.add_expense.assert_called_once()
+            screen.start_import_asset_review.assert_called_once_with(asset)
+            self.assertEqual(retained,[])
+            client.import_invoices.assert_not_called()
+            client.add_expense.assert_not_called()
+            client.upload_attachment.assert_not_called()
+            client.upload_expense_attachment.assert_not_called()
+            warning.assert_not_called()
 
     def test_expense_import_uses_accounts_selected_in_preview(self):
         row={"line":"001","invoice_number":"EXP-1","invoice_date":"15-03-2026","party_name":"Office expense",

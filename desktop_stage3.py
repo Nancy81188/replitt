@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import mimetypes
 import os
+import subprocess
+import sys
+import tempfile
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -11,7 +14,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from importer import read_customs_costs, read_expenses, read_invoices
 from chart_extra import EXPENSE_VAT, PURCHASE_VAT, SALES_VAT
-from pdf_import import read_invoice_pdf, read_invoice_pdf_pages
+from pdf_import import asset_pdf_details, read_invoice_pdf, read_invoice_pdf_pages
 from report_export import export_excel, export_pdf
 
 NAVY, GOLD, LIGHT = "#071b2e", "#c9a96a", "#f3f6f8"
@@ -188,13 +191,16 @@ class Stage3Mixin:
                 continue
             for data in documents:
                 suggested = "Sales" if self.import_type.get()=="Sales" else data.get("suggested_type") or ""
+                asset_details=asset_pdf_details(data)
                 type_note = (f"Suggested Type: {suggested}; review before import" if suggested else
                              "Type not clear from PDF; choose Purchases, Expenses or Assets")
                 rows.append({"invoice_number": data.get("invoice_number") or "", "invoice_date": data.get("invoice_date") or "",
                          "party_name": data.get("party_name") or "", "currency": data.get("currency") or self.currency.get(),
                           "subtotal": data.get("subtotal"), "vat": data.get("vat"), "total": data.get("total"),
                           "entry_type": suggested, "source": f'{data["file"]} - {data["page_range"]}',
-                          "notes": (data.get("notes", "") + "; " + type_note).strip("; "), "_path": path})
+                           "notes": (data.get("notes", "") + "; " + type_note).strip("; "), "_path": path,
+                           "_asset_name":asset_details["name"],"_asset_date":asset_details["acquired_on"],
+                           "_asset_currency":asset_details["currency"],"_asset_cost":asset_details["cost"]})
         self.import_mode = "pdf"; self.import_rows = rows
         self.file_label.config(text=f"{len(paths)} PDF file(s). Confirm each Type and amount; VAT 0 if none. Expenses are paid transactions.", fg=NAVY); self.populate_import_preview()
 
@@ -219,6 +225,23 @@ class Stage3Mixin:
     def send_import(self):
         rows = self.import_sheet.ordered()
         if not rows: return messagebox.showwarning("Import", "Choose an Excel or PDF file first")
+        asset_rows=[r for r in rows if self.import_mode=="pdf" and r.get("entry_type")=="Assets"]
+        if asset_rows:
+            row=asset_rows[0]
+            if not str(row.get("expense_account") or "").split(" - ",1)[0].strip().startswith("2"):
+                return messagebox.showwarning("Asset PDF",
+                    f"PDF row {row.get('line','')}: choose a class 2 fixed-asset account before register review.")
+            if not messagebox.askyesno("Review asset PDF",
+                    "This Assets row will create one fixed-asset register item after review. "
+                    "It will NOT create a supplier invoice, journal posting, stock movement, or PDF attachment. "
+                    "Process this row now?"):
+                return
+            reviewer=getattr(self,"start_import_asset_review",None)
+            if not callable(reviewer):
+                return messagebox.showerror("Asset PDF",
+                    "Asset register review is unavailable. The preview row was kept and no invoice was posted.")
+            reviewer(row)
+            return
         kind, entry_type = TYPES[self.import_type.get()]
         missing = [r["line"] for r in rows if not r.get("party_name") or r.get("total") in (None, "")]
         if missing: return messagebox.showwarning("Import", f"Row(s) {', '.join(missing[:10])}: enter the customer/supplier and the total")
@@ -316,6 +339,25 @@ class Stage3Mixin:
             self.import_rows = remaining
             if remaining and self.import_replace.get(): self.import_replace.set(False)
         self.load_dashboard(); self.load_invoices(); self.load_journal(); self.load_trial(); self.load_transactions()
+
+    def start_import_asset_review(self,row):
+        """Route an Assets preview row to the register, never to invoice import/posting."""
+        self.new_asset()
+        for key in ("name","acquired_on","start_on","currency","cost"):
+            self.asset_fields[key].set("")
+        for key,value in (("name",row.get("_asset_name")),("acquired_on",row.get("_asset_date")),
+                          ("currency",row.get("_asset_currency")),("cost",row.get("_asset_cost")),
+                          ("asset_account",row.get("expense_account"))):
+            if value not in (None,""):
+                self.asset_fields[key].set(f"{value:.2f}" if key=="cost" else str(value))
+        if row.get("_asset_date"):
+            self.asset_fields["start_on"].set(row["_asset_date"])
+        def complete(_asset):
+            self.import_rows=[item for item in self.import_rows if item is not row]
+            self.populate_import_preview()
+            self.import_status.config(text=f"Asset registered; {len(self.import_sheet.ordered())} preview row(s) remain")
+        self.review_asset_pdf(row.get("_path") or row.get("source","PDF preview"),
+                              row.get("notes",""),on_created=complete)
 
     # ================================================================ Payment & Receipt
     def build_transactions(self):
@@ -581,11 +623,11 @@ class Stage3Mixin:
                   "currency":"USD","cost":"","residual":"0","useful_months":"60","frequency":"monthly",
                   "asset_account":"","depreciation_account":"","accumulated_account":"","invoice_id":""}
         self.asset_fields={key:tk.StringVar(value=value) for key,value in defaults.items()}
-        self.asset_rate=tk.StringVar(value="20")
+        self.asset_rate=tk.StringVar(value="")
         sections=[("1. Purchase details",[[ ("Asset code","asset_code"),("Description","name"),("Currency","currency")],
             [("Purchase date","acquired_on"),("Purchase value","cost"),("Purchase invoice ID","invoice_id")],
             [("Asset account","asset_account")]]),
-            ("2. Amortisation settings",[[ ("Amortisation start","start_on"),("Residual value","residual"),("Annual rate %","rate")],
+            ("2. Amortisation settings",[[ ("Amortisation start","start_on"),("Residual value","residual"),("Annual rate % (review-required)","rate")],
             [("Useful life (months)","useful_months"),("Post","frequency")],
             [("Amortisation expense","depreciation_account"),("Accumulated amortisation","accumulated_account")]])]
         for title,layout in sections:
@@ -608,11 +650,12 @@ class Stage3Mixin:
         for key in ("cost","residual"):
             self.asset_fields[key].trace_add("write",self.asset_rate_changed)
         actions=tk.Frame(page,bg=LIGHT); actions.pack(fill="x",padx=8,pady=4)
+        self.action_button(actions,"Upload PDF",self.choose_asset_pdf).pack(side="left",padx=3)
         self.action_button(actions,"Record Asset Purchase",self.open_asset_purchase).pack(side="left",padx=3)
         for label,command in (("Annual Rollforward",self.show_asset_rollforward),("New",self.new_asset),("Save",self.save_asset_entry),("Delete",self.delete_asset_entry),
-                              ("Post selected period",self.post_asset_period),("Refresh",self.load_assets)):
+                              ("PDF Attachments",self.asset_attachments_window),("Post selected period",self.post_asset_period),("Refresh",self.load_assets)):
             self.action_button(actions,label,command).pack(side="left",padx=3)
-        tk.Label(actions,text="Posted periods stay in the journal; review the schedule before posting.",bg=LIGHT,fg=MUTED).pack(side="left",padx=12)
+        tk.Label(actions,text="Enter and verify the annual rate (review required); no Lebanese rate is assumed.",bg=LIGHT,fg=MUTED).pack(side="left",padx=12)
         lists=tk.Frame(page,bg=LIGHT); lists.pack(fill="both",expand=True,padx=8,pady=4)
         self.asset_list=ttk.Treeview(lists,columns=("code","name","purchase","cost","currency","previous","yearly","cumulative","net"),show="headings",height=5)
         for key,title,width in (("code","Asset",90),("name","Description",150),("purchase","Purchase date",105),("cost","Purchase value",100),("currency","Currency",70),
@@ -627,11 +670,101 @@ class Stage3Mixin:
 
     def new_asset(self):
         self.asset_edit_id=None
-        self.asset_rate.set("20")
+        self.asset_rate.set("")
         for key,var in self.asset_fields.items():
             var.set({"acquired_on":self.fiscal_today(),"start_on":self.fiscal_today(),"currency":"USD","residual":"0",
                      "useful_months":"60","frequency":"monthly"}.get(key,""))
         self.asset_schedule_tree.delete(*self.asset_schedule_tree.get_children())
+
+    def choose_asset_pdf(self):
+        path=filedialog.askopenfilename(filetypes=[("PDF asset invoice","*.pdf")])
+        if not path: return
+        try:
+            size=Path(path).stat().st_size
+            if not size or size>15*1024*1024: raise ValueError("Choose a non-empty PDF smaller than 15 MB")
+            data=read_invoice_pdf(path)
+        except Exception as exc:
+            return messagebox.showerror("Asset PDF",f"Could not read the PDF: {exc}")
+        details=asset_pdf_details(data)
+        self.new_asset()
+        for key in ("name","acquired_on","start_on","currency","cost"):
+            self.asset_fields[key].set("")
+        for key in ("name","acquired_on","currency","cost"):
+            value=details.get(key)
+            if value not in (None,""):
+                self.asset_fields[key].set(f"{value:.2f}" if key=="cost" else str(value))
+        if details.get("acquired_on"):
+            self.asset_fields["start_on"].set(details["acquired_on"])
+        self.review_asset_pdf(path,data.get("notes",""))
+
+    def review_asset_pdf(self,path,parser_notes="",on_created=None):
+        """Editable, explicit review of all register-defining fields before creation."""
+        window=tk.Toplevel(self); window.title("Review PDF fixed asset"); window.configure(bg=LIGHT)
+        window.transient(self)
+        tk.Label(window,text="Review asset details before creating the register item",
+                 bg=LIGHT,fg=NAVY,font=("Segoe UI",12,"bold")).pack(anchor="w",padx=12,pady=(10,4))
+        tk.Label(window,text="PDF values are suggestions only. Verify the asset code, class-2 cost account, "
+                 "depreciation and accumulated accounts, and enter a rate you have independently verified. "
+                 "No Lebanese legal rate is assumed.",bg=LIGHT,fg=RED,wraplength=690,justify="left").pack(fill="x",padx=12,pady=4)
+        tk.Label(window,text=f"{Path(path).name} — {parser_notes or 'Review extracted fields'}",
+                 bg=LIGHT,fg=MUTED,wraplength=690,justify="left").pack(fill="x",padx=12,pady=4)
+        fields=tk.Frame(window,bg=LIGHT); fields.pack(fill="x",padx=12,pady=4)
+        prompts=(("Asset code","asset_code"),("Asset name","name"),("Purchase date","acquired_on"),
+                 ("Currency","currency"),("Acquisition cost","cost"),("Class-2 asset account","asset_account"),
+                 ("Depreciation expense account","depreciation_account"),
+                 ("Accumulated depreciation account","accumulated_account"),("Annual rate % (review-required)","rate"))
+        for row,(label,key) in enumerate(prompts):
+            tk.Label(fields,text=label,bg=LIGHT).grid(row=row,column=0,sticky="w",padx=4,pady=3)
+            if key in ("asset_account","depreciation_account","accumulated_account"):
+                widget=self.account_search_box(fields,self.asset_fields[key],32)
+            elif key=="currency":
+                widget=ttk.Combobox(fields,textvariable=self.asset_fields[key],state="readonly",width=28,
+                                    values=["USD","LBP","EUR","AED"])
+            elif key=="rate":
+                widget=tk.Entry(fields,textvariable=self.asset_rate,width=31)
+            else:
+                widget=tk.Entry(fields,textvariable=self.asset_fields[key],width=34)
+            widget.grid(row=row,column=1,sticky="ew",padx=5,pady=3)
+        fields.grid_columnconfigure(1,weight=1)
+        agreed=tk.BooleanVar(value=False)
+        tk.Checkbutton(window,text="I reviewed and verified the asset classification, all three accounts, and annual rate.",
+                       variable=agreed,bg=LIGHT,fg=NAVY,wraplength=680,justify="left").pack(anchor="w",padx=12,pady=7)
+        tk.Label(window,text="The source PDF will be saved as an attachment to this register item. "
+                 "Creating this register item does not post a journal entry or stock movement.",
+                 bg=LIGHT,fg=MUTED,wraplength=690,justify="left").pack(fill="x",padx=12,pady=3)
+        controls=tk.Frame(window,bg=LIGHT); controls.pack(fill="x",padx=12,pady=(4,10))
+        def create():
+            if not agreed.get():
+                return messagebox.showwarning("Review required","Confirm that you reviewed the accounts and annual rate.",parent=window)
+            created=self.save_asset_entry(review_confirmed=True)
+            if created:
+                asset_id=created["id"]
+                was_duplicate=bool(created.pop("_already_registered",False))
+                window.destroy()
+                try:
+                    self.upload_asset_pdf(asset_id,path)
+                except Exception as exc:
+                    if on_created:
+                        try: on_created(created)
+                        except Exception as callback_exc:
+                            messagebox.showwarning("Asset saved",f"Register item saved, but preview refresh failed: {callback_exc}")
+                    messagebox.showwarning("Asset saved; PDF attachment failed",
+                        f"Asset {created['asset_code']} is SAVED in the register, but the PDF attachment is not confirmed: {exc}\n"
+                        "Select this asset and use PDF Attachments → Attach / Retry PDF. That action retries the attachment only; "
+                        "it will not create an asset, invoice, journal entry, or stock movement.")
+                    return
+                if on_created:
+                    try: on_created(created)
+                    except Exception as exc:
+                        messagebox.showwarning("Asset saved",f"Asset and PDF attachment were saved, but preview refresh failed: {exc}")
+                action="already existed in the register" if was_duplicate else "was added to the fixed-asset register"
+                messagebox.showinfo("Asset PDF",
+                    f"Asset {created['asset_code']} {action}; its schedule is visible and the source PDF is attached.\n"
+                    "No journal entry or stock movement was posted.")
+        self.action_button(controls,"Create register item",create).pack(side="right",padx=4)
+        self.action_button(controls,"Cancel",window.destroy).pack(side="right",padx=4)
+        window.grab_set()
+        self.fit_dialog(window,760,650,min_width=600,min_height=520)
 
     def load_assets(self):
         try: self.asset_rows=self.client.fixed_assets()
@@ -708,20 +841,127 @@ class Stage3Mixin:
         for key,var in self.asset_fields.items():
             value=asset.get(key) or ""
             var.set(_dd(value) if key in ("acquired_on","start_on") and value else str(value))
-        self.asset_rate.set(str(asset.get("annual_rate") or f'{1200/int(asset["useful_months"]):g}'))
+        self.asset_rate.set(str(asset.get("annual_rate") or ""))
         self.asset_schedule_tree.delete(*self.asset_schedule_tree.get_children())
         try: rows=self.client.asset_schedule(self.asset_edit_id)
         except Exception as exc: return messagebox.showerror("Assets",str(exc))
         for row in rows: self.asset_schedule_tree.insert("","end",iid=row["period_end"],values=(_dd(row["period_end"]),row["amount"],row["accumulated"],row["net_book_value"],"Posted" if row["posted"] else "Draft"))
 
-    def save_asset_entry(self):
+    def upload_asset_pdf(self,asset_id,path):
+        path=Path(path)
+        size=path.stat().st_size
+        if not size or size>15*1024*1024:
+            raise ValueError("Choose a non-empty PDF smaller than 15 MB")
+        if path.suffix.lower()!=".pdf":
+            raise ValueError("Choose a PDF file")
+        content=path.read_bytes()
+        if not content.startswith(b"%PDF-"):
+            raise ValueError("The selected file is not a valid PDF")
+        return self.client.upload_asset_attachment(asset_id,path.name,"application/pdf",content)
+
+    def asset_attachments_window(self):
+        if not self.asset_edit_id:
+            return messagebox.showwarning("Asset PDF","Select a fixed asset first")
+        asset=next((row for row in self.asset_rows if row["id"]==self.asset_edit_id),None)
+        if not asset: return messagebox.showwarning("Asset PDF","Select a fixed asset first")
+        asset_id=asset["id"]
+        window=tk.Toplevel(self); window.title(f"PDF Attachments — {asset['asset_code']}"); window.configure(bg=LIGHT)
+        window.transient(self)
+        tk.Label(window,text=f"Source PDFs for {asset['asset_code']} — {asset['name']}",
+                 bg=LIGHT,fg=NAVY,font=("Segoe UI",11,"bold")).pack(anchor="w",padx=10,pady=(10,3))
+        tree=ttk.Treeview(window,columns=("file","size","uploaded","hash"),show="headings",height=8)
+        for key,label,width in (("file","File",260),("size","Size",80),("uploaded","Uploaded",145),("hash","Content hash",230)):
+            tree.heading(key,text=label); tree.column(key,width=width,stretch=key=="file")
+        tree.pack(fill="both",expand=True,padx=8,pady=6)
+        records=[]
+        def refresh():
+            try: records[:]=self.client.asset_attachments(asset_id)
+            except Exception as exc:
+                messagebox.showerror("Asset PDF",str(exc),parent=window); return
+            tree.delete(*tree.get_children())
+            for record in records:
+                tree.insert("","end",iid=str(record["id"]),values=(record["file_name"],
+                    f'{record["size"]/1024:,.0f} KB',str(record["uploaded_at"])[:16],record.get("sha256","")[:20]))
+        def attach():
+            path=filedialog.askopenfilename(parent=window,filetypes=[("PDF files","*.pdf")])
+            if not path: return
+            try: result=self.upload_asset_pdf(asset_id,path)
+            except Exception as exc:
+                return messagebox.showwarning("Asset saved; retry PDF attachment",
+                    f"Asset {asset['asset_code']} remains SAVED; attachment was not confirmed: {exc}\n"
+                    "You can retry this PDF attachment here. The register and accounting postings will not be changed.",parent=window)
+            refresh()
+            messagebox.showinfo("Asset PDF","PDF attachment saved" + (" (identical content already attached)." if result.get("duplicate") else ".")
+                                + "\nThe register was not recreated and no posting was made.",parent=window)
+        def selected_record():
+            selected=tree.selection()
+            return next((item for item in records if str(item["id"])==selected[0]),None) if selected else None
+        def download(open_after=False):
+            record=selected_record()
+            if not record: return messagebox.showwarning("Asset PDF","Select an attachment first",parent=window)
+            try: content=self.client.download_asset_attachment(record["id"])["content"]
+            except Exception as exc: return messagebox.showerror("Asset PDF",str(exc),parent=window)
+            if open_after:
+                try:
+                    with tempfile.NamedTemporaryFile(prefix="saber-asset-",suffix=".pdf",delete=False) as temp:
+                        temp.write(content); saved=temp.name
+                    if hasattr(os,"startfile"): os.startfile(saved)
+                    else: subprocess.Popen(["open" if sys.platform=="darwin" else "xdg-open",saved])
+                except Exception as exc: return messagebox.showerror("Open PDF",f"Could not open the PDF: {exc}",parent=window)
+            else:
+                target=filedialog.asksaveasfilename(parent=window,initialfile=Path(record["file_name"]).name,
+                    defaultextension=".pdf",filetypes=[("PDF files","*.pdf")])
+                if not target: return
+                try: Path(target).write_bytes(content)
+                except Exception as exc: return messagebox.showerror("Download PDF",str(exc),parent=window)
+                messagebox.showinfo("Asset PDF",f"PDF downloaded to:\n{target}",parent=window)
+        tree.bind("<Double-1>",lambda _event:download(True))
+        controls=tk.Frame(window,bg=LIGHT); controls.pack(fill="x",padx=8,pady=(0,8))
+        self.action_button(controls,"Attach / Retry PDF",attach).pack(side="left",padx=3)
+        self.action_button(controls,"Download selected",lambda:download(False)).pack(side="left",padx=3)
+        self.action_button(controls,"Open selected",lambda:download(True)).pack(side="left",padx=3)
+        self.action_button(controls,"Refresh",refresh).pack(side="left",padx=3)
+        self.action_button(controls,"Close",window.destroy).pack(side="right",padx=3)
+        tk.Label(window,text="Attach / Retry affects only this saved asset's PDF documents; it never saves or posts the asset.",
+                 bg=LIGHT,fg=MUTED,wraplength=690,justify="left").pack(anchor="w",padx=10,pady=(0,6))
+        refresh(); self.fit_dialog(window,760,420,min_width=650,min_height=320)
+
+    def save_asset_entry(self,review_confirmed=False):
         payload={key:var.get().strip() for key,var in self.asset_fields.items()}
         payload["annual_rate"]=self.asset_rate.get().strip()
         if not payload["invoice_id"]: payload["invoice_id"]=None
+        if not payload["annual_rate"]:
+            messagebox.showwarning("Assets","Enter and independently verify an annual depreciation rate; it is review-required.")
+            return None
+        if not payload["asset_account"].split(" - ",1)[0].strip().startswith("2"):
+            messagebox.showwarning("Assets","Choose a class-2 asset account.")
+            return None
+        if review_confirmed:
+            try: existing=self.client.fixed_assets()
+            except Exception as exc: return messagebox.showerror("Assets",f"Cannot check for duplicate assets: {exc}")
+            def amount(value):
+                try: return round(float(str(value).replace(",","")),2)
+                except (TypeError,ValueError): return None
+            duplicate=next((row for row in existing if
+                str(row.get("name","")).strip().casefold()==payload["name"].strip().casefold()
+                and _dd(row.get("acquired_on"))==_dd(payload["acquired_on"])
+                and row.get("currency")==payload["currency"].upper()
+                and amount(row.get("cost"))==amount(payload["cost"])),None)
+            if duplicate:
+                self.load_assets()
+                self.asset_list.selection_set(str(duplicate["id"])); self.select_asset()
+                messagebox.showwarning("Asset PDF",f"This asset appears to already be registered as {duplicate['asset_code']}. "
+                    "No duplicate register item will be created; the selected PDF will be attached to this existing item.")
+                return {"_already_registered":True,**duplicate}
         try: asset=self.client.save_asset(payload,self.asset_edit_id)
         except Exception as exc: return messagebox.showerror("Assets",str(exc))
-        self.load_assets(); self.asset_list.selection_set(str(asset["id"])); self.select_asset()
-        messagebox.showinfo("Assets",f"Asset {asset['asset_code']} saved")
+        self.load_assets()
+        if self.asset_list.exists(str(asset["id"])):
+            self.asset_list.selection_set(str(asset["id"])); self.select_asset()
+        else:
+            self.asset_edit_id=asset["id"]
+        if not review_confirmed: messagebox.showinfo("Assets",f"Asset {asset['asset_code']} saved")
+        return asset
 
     def asset_rate_changed(self,*_args):
         try:
@@ -1032,7 +1272,10 @@ class Stage3Mixin:
                 if data.get("invoice_date"): v["date"].set(data["invoice_date"])
                 elif v["date"].get() == self.fiscal_today(): v["date"].set("")
                 if data.get("currency"): v["currency"].set(data["currency"])
-                if data.get("subtotal") and not v["taxable"].get(): v["taxable"].set(f'{data["subtotal"]:.2f}')
+                subtotal=data.get("subtotal")
+                if subtotal is None and data.get("total") is not None and data.get("vat") is not None:
+                    subtotal=round(data["total"]-data["vat"],2)
+                if subtotal is not None and not v["taxable"].get(): v["taxable"].set(f'{subtotal:.2f}')
                 if data.get("party_name") and not v["supplier"].get(): v["supplier"].set(data["party_name"])
                 item_note = self.add_purchase_pdf_items(data)
                 self.purchase_amounts_changed("none")
@@ -1475,7 +1718,10 @@ class Stage3Mixin:
             elif v["date"].get() == self.fiscal_today(): v["date"].set("")
             if data.get("currency"): v["currency"].set(data["currency"])
             if data.get("party_name") and not v["description"].get(): v["description"].set(data["party_name"])
-            if data.get("subtotal") and not v["with_vat"].get(): v["with_vat"].set(f'{data["subtotal"]:.2f}')
+            subtotal=data.get("subtotal")
+            if subtotal is None and data.get("total") is not None and data.get("vat") is not None:
+                subtotal=round(data["total"]-data["vat"],2)
+            if subtotal is not None and not v["with_vat"].get(): v["with_vat"].set(f'{subtotal:.2f}')
             self.expense_amounts_changed("none")
             suggestion=f["pdf_suggested_type"]
             f["pdf_label"].config(text=f"{Path(path).name}: {data.get('notes', '')}" +

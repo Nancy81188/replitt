@@ -362,6 +362,8 @@ def export_sections_excel(path, title, meta, sections):
         ws.row_dimensions[row].height = 30; row += 1
         totals = set(section.get("total_rows") or [])
         for index, values in enumerate(section["rows"]):
+            if len(values) > len(section["headers"]):
+                raise ValueError(f"Section {section['heading']!r} has more values than headers")
             height = 15
             for column, value in enumerate(values, 1):
                 c = ws.cell(row, column, _plain(value))

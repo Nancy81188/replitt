@@ -33,7 +33,8 @@ def migrate(db):
                                ("active", "INTEGER NOT NULL DEFAULT 1"), ("notes", "TEXT"), ("barcode", "TEXT"), ("created_at", "TEXT")):
         if column not in item_columns: db.execute(f"ALTER TABLE inventory_items ADD COLUMN {column} {definition}")
     movement_columns = {row["name"] for row in db.execute("PRAGMA table_info(stock_movements)")}
-    for column, definition in (("warehouse_id", "INTEGER"), ("document_id", "INTEGER"), ("movement_type", "TEXT"), ("sales_price", "TEXT"), ("line_no", "INTEGER")):
+    for column, definition in (("warehouse_id", "INTEGER"), ("document_id", "INTEGER"), ("movement_type", "TEXT"), ("sales_price", "TEXT"), ("line_no", "INTEGER"),
+                               ("invoice_item_id","INTEGER"),("cost_layers","TEXT")):
         if column not in movement_columns: db.execute(f"ALTER TABLE stock_movements ADD COLUMN {column} {definition}")
     db.execute("CREATE TABLE IF NOT EXISTS item_categories (id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER, UNIQUE(name,parent_id))")
     db.execute("CREATE TABLE IF NOT EXISTS item_units (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)")
@@ -119,7 +120,7 @@ def _movements(database, date_to=None, exclude_document_id=None):
     return [r for r in rows if (not date_to or r["doc_date"] <= date_to) and r["document_id"] != exclude_document_id]
 
 
-def run_costing(database, date_to=None, method=None, callback=None, exclude_document_id=None):
+def run_costing(database, date_to=None, method=None, callback=None, exclude_document_id=None, layers_callback=None):
     """Replays every movement in date order. Returns per-item {qty, value, by_warehouse, last_date}.
 
     Average: company-wide moving average; transfers carry that average cost.
@@ -137,11 +138,26 @@ def run_costing(database, date_to=None, method=None, callback=None, exclude_docu
             taken = []
             while amount > 0 and layers:
                 layer = layers[0]; take = min(layer[0], amount)
-                taken.append([take, layer[1], layer[2]])
+                taken.append([take, layer[1], layer[2],layer[3],layer[4]])
                 layer[0] -= take; amount -= take
                 if layer[0] == 0: layers.pop(0)
             if amount:
                 raise ValueError(f"FIFO stock history has insufficient layers for item {row['item_id']} in warehouse {wid}")
+            return taken
+        def take_specific_layers(requested):
+            taken=[]
+            for target in requested:
+                amount=_d(target.get("quantity"))
+                for layer in list(layers):
+                    if (layer[3],layer[4])!=(int(target["source_document_id"]),int(target["source_line_no"])): continue
+                    take=min(amount,layer[0])
+                    if take:
+                        taken.append([take,layer[1],layer[2],layer[3],layer[4]])
+                        layer[0]-=take; amount-=take
+                        if not layer[0]: layers.remove(layer)
+                    if not amount: break
+                if amount:
+                    raise ValueError(f"Original FIFO purchase layer for item {row['item_id']} has only {(_d(target.get('quantity'))-amount):,.3f} available in this warehouse")
             return taken
         if row["doc_type"] == "transfer":
             key = (row["document_id"], row["line_no"], row["item_id"])
@@ -161,23 +177,46 @@ def run_costing(database, date_to=None, method=None, callback=None, exclude_docu
             continue
         if qty > 0:
             item["qty"] += qty; item["value"] += qty * cost
-            if method == "fifo": layers.append([qty, cost, row["doc_date"]])
+            if method == "fifo":
+                try: costing_layers=json.loads(row.get("cost_layers") or "[]")
+                except (TypeError,ValueError): costing_layers=[]
+                if costing_layers:
+                    added=sum((_d(part["quantity"])*_d(part["unit_cost"]) for part in costing_layers),ZERO)
+                    if added.quantize(Decimal("0.000001"))!=(qty*cost).quantize(Decimal("0.000001")):
+                        raise ValueError(f"Receipt {row['number']} has invalid costing layers")
+                    for part in costing_layers:
+                        layers.append([_d(part["quantity"]),_d(part["unit_cost"]),row["doc_date"],row["document_id"],row["line_no"]])
+                else: layers.append([qty, cost, row["doc_date"],row["document_id"],row["line_no"]])
             else: item["layers"].append([qty, cost])
             issued_cost = cost
         else:
             out = -qty
-            if method == "fifo":
-                total = sum((part[0] * part[1] for part in take_layers(out)), ZERO)
+            try: explicit_layers=json.loads(row.get("cost_layers") or "[]")
+            except (TypeError,ValueError): explicit_layers=[]
+            if row.get("movement_type")=="purchase_return" and explicit_layers:
+                if sum((_d(part["quantity"]) for part in explicit_layers),ZERO)!=out:
+                    raise ValueError(f"Purchase return {row['number']} has invalid original-layer quantities")
+                taken=take_specific_layers(explicit_layers) if method=="fifo" else []
+                issued_cost=sum((_d(part.get("unit_cost") or part.get("cost"))*_d(part["quantity"]) for part in explicit_layers),ZERO)/out
+                issued_layers=[[str(_d(part["quantity"])),str(_d(part.get("unit_cost") or part.get("cost")))] for part in explicit_layers]
+            elif method == "fifo":
+                taken=take_layers(out)
+                total = sum((part[0] * part[1] for part in taken), ZERO)
                 issued_cost = total / out if out else ZERO
+                issued_layers=[{"quantity":str(part[0]),"unit_cost":str(part[1]),"source_document_id":part[3],"source_line_no":part[4]} for part in taken]
             else:
                 issued_cost = (item["value"] / item["qty"]) if item["qty"] else ZERO
                 for layer in item["layers"]: layer[1] = issued_cost
+                issued_layers=[{"quantity":str(out),"unit_cost":str(issued_cost)}]
             item["qty"] -= out; item["value"] -= out * issued_cost; item["last_out"] = row["doc_date"]
             if item["qty"] <= 0: item["value"] = ZERO; item["layers"] = []
         if callback: callback(row, issued_cost, qty * issued_cost)
+        if layers_callback and qty<0: layers_callback(row,issued_layers)
     if transfers: raise ValueError("Unpaired FIFO transfer in stock history")
     for item in state.values():
-        item["warehouse_value"] = ({wid: sum((q * cost for q, cost, _day in layers), ZERO)
+        if item["qty"]>0 and item["value"]<Decimal("-0.000001"):
+            raise ValueError("Stock movement would make the remaining inventory value negative")
+        item["warehouse_value"] = ({wid: sum((layer[0] * layer[1] for layer in layers), ZERO)
                                     for wid, layers in item["warehouse_layers"].items()} if method == "fifo"
                                    else {wid: qty * item["value"] / item["qty"] if item["qty"] else ZERO
                                          for wid, qty in item["by_warehouse"].items()})
@@ -218,6 +257,50 @@ def next_number(database, doc_type, date):
     return f"{prefix}-{year}-{max(numbers, default=0) + 1:06d}"
 
 
+def _recorded_conversion_rate(database, source, target, date):
+    source=str(source or "").upper(); target=str(target or "").upper()
+    if source==target: return Decimal("1")
+    try: date_key=iso_date(date).replace("-","")
+    except ValueError as exc: raise ValueError("A valid invoice date is required for inventory currency conversion") from exc
+    sortable="""CASE WHEN rate_date GLOB '??-??-????' THEN substr(rate_date,7,4)||substr(rate_date,4,2)||substr(rate_date,1,2)
+        ELSE replace(rate_date,'-','') END"""
+    def rate(frm,to):
+        with database.connect() as db:
+            row=db.execute(f"SELECT rate FROM exchange_rates WHERE from_currency=? AND to_currency=? AND {sortable}<=? ORDER BY {sortable} DESC,id DESC LIMIT 1",
+                           (frm,to,date_key)).fetchone()
+            if row: return Decimal(str(row["rate"]))
+            row=db.execute(f"SELECT rate FROM exchange_rates WHERE from_currency=? AND to_currency=? AND {sortable}<=? ORDER BY {sortable} DESC,id DESC LIMIT 1",
+                           (to,frm,date_key)).fetchone()
+            if row:
+                value=Decimal(str(row["rate"]))
+                return Decimal("1")/value if value else None
+        return None
+    direct=rate(source,target)
+    if direct is not None and direct.is_finite() and direct>0: return direct
+    first=rate(source,"USD") if source!="USD" else Decimal("1")
+    second=rate("USD",target) if target!="USD" else Decimal("1")
+    if first is not None and second is not None and first.is_finite() and second.is_finite() and first>0 and second>0:
+        return first*second
+    raise ValueError(f"No recorded exchange rate from {source} to inventory currency {target} on {date}; enter a reviewed rate before posting stock")
+
+
+def _convert_inventory_cost(database, invoice, unit_cost):
+    target=settings(database)["currency"]; source=str(invoice.get("currency") or target).upper()
+    rate=_recorded_conversion_rate(database,source,target,invoice.get("invoice_date"))
+    return _d(unit_cost)*rate
+
+
+def _assert_nonnegative_history(db):
+    balances={}
+    rows=db.execute("""SELECT m.item_id,m.warehouse_id,m.quantity,d.number,d.doc_date
+        FROM stock_movements m JOIN stock_documents d ON d.id=m.document_id ORDER BY d.doc_date,d.id,m.id""")
+    for row in rows:
+        key=(row["item_id"],row["warehouse_id"])
+        balances[key]=balances.get(key,ZERO)+_d(row["quantity"])
+        if balances[key]<Decimal("-0.000001"):
+            raise ValueError(f"Stock movement {row['number']} on {display_date(row['doc_date'])} would make later stock negative")
+
+
 def save_document(database, header, lines, user_id, document_id=None):
     doc_type = str(header.get("doc_type") or "").lower()
     if doc_type not in DOC_TYPES: raise ValueError("Choose the document type")
@@ -240,7 +323,9 @@ def save_document(database, header, lines, user_id, document_id=None):
             if cost < 0: raise ValueError(f"Line {index}: unit cost cannot be negative")
             if DOC_TYPES[doc_type][2] > 0 and not cost and doc_type not in ("adjustment_in", "opening"):
                 raise ValueError(f"Line {index}: enter the unit cost of {item['sku']}")
-            normalized.append((item, qty, cost, _d(line.get("sales_price")))); items[item["id"]] = items.get(item["id"], ZERO) + qty
+            normalized.append((item, qty, cost, _d(line.get("sales_price")),line.get("invoice_item_id"),
+                               line.get("cost_layers"),line.get("movement_type") or doc_type))
+            items[item["id"]] = items.get(item["id"], ZERO) + qty
     # Stock may not go negative: check the quantity available in the warehouse on the document date.
     if DOC_TYPES[doc_type][2] <= 0:
         state = run_costing(database, date) if not document_id else _state_without(database, date, document_id)
@@ -253,6 +338,8 @@ def save_document(database, header, lines, user_id, document_id=None):
         if document_id:
             old = db.execute("SELECT * FROM stock_documents WHERE id=?", (int(document_id),)).fetchone()
             if not old: raise KeyError("Stock document not found")
+            if old["invoice_id"]:
+                database._assert_no_active_linked_returns(db,old["invoice_id"],"edit stock for")
             database._assert_period_open(old["doc_date"]); number = old["number"]
             db.execute("DELETE FROM stock_movements WHERE document_id=?", (int(document_id),))
             db.execute("""UPDATE stock_documents SET doc_type=?,doc_date=?,warehouse_id=?,to_warehouse_id=?,party_id=?,reference=?,notes=? WHERE id=?""",
@@ -264,14 +351,17 @@ def save_document(database, header, lines, user_id, document_id=None):
                 VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (number, doc_type, date, warehouse["id"], target["id"] if target else None, header.get("party_id") or None,
                 header.get("invoice_id") or None, header.get("reference") or None, header.get("notes") or None, user_id, utcnow())).lastrowid
         sign = DOC_TYPES[doc_type][2]
-        for position, (item, qty, cost, price) in enumerate(normalized, 1):
+        for position, (item, qty, cost, price, invoice_item_id, cost_layers, movement_type) in enumerate(normalized, 1):
             if doc_type == "transfer":
                 for warehouse_id, signed in ((warehouse["id"], -qty), (target["id"], qty)):
                     db.execute("""INSERT INTO stock_movements(item_id,movement_date,quantity,unit_cost,source_type,source_id,warehouse_id,document_id,movement_type,line_no)
                         VALUES(?,?,?,?,?,?,?,?,?,?)""", (item["id"], date, str(signed), "0", "stock", saved, warehouse_id, saved, doc_type, position))
             else:
-                db.execute("""INSERT INTO stock_movements(item_id,movement_date,quantity,unit_cost,source_type,source_id,warehouse_id,document_id,movement_type,sales_price,line_no)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (item["id"], date, str(qty * sign), str(cost), "stock", saved, warehouse["id"], saved, doc_type, str(price), position))
+                db.execute("""INSERT INTO stock_movements(item_id,movement_date,quantity,unit_cost,source_type,source_id,warehouse_id,document_id,movement_type,sales_price,line_no,invoice_item_id,cost_layers)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (item["id"], date, str(qty * sign), str(cost), "stock", saved, warehouse["id"], saved,
+                    movement_type, str(price), position,invoice_item_id,json.dumps(cost_layers) if cost_layers else None))
+        _assert_nonnegative_history(db)
+        run_costing(database,method=settings(database)["method"])
         db.execute("INSERT INTO audit_log(user_id,action,entity,entity_id,details,created_at) VALUES(?,?,?,?,?,?)",
             (user_id, "save", "stock_document", saved, json.dumps({"number": number, "type": doc_type, "lines": len(normalized)}), utcnow()))
     return get_document(database, saved)
@@ -307,6 +397,8 @@ def delete_document(database, document_id, user_id):
     if DOC_TYPES[doc["doc_type"]][2] > 0:  # removing stock that was already issued afterwards would make it negative
         _check_after_removal(database, document_id)
     with database.connect() as db:
+        if doc.get("invoice_id"):
+            database._assert_no_active_linked_returns(db,doc["invoice_id"],"delete stock for")
         db.execute("DELETE FROM stock_movements WHERE document_id=?", (int(document_id),)); db.execute("DELETE FROM stock_documents WHERE id=?", (int(document_id),))
         db.execute("INSERT INTO audit_log(user_id,action,entity,entity_id,details,created_at) VALUES(?,?,?,?,?,?)", (user_id, "delete", "stock_document", int(document_id), json.dumps({"number": doc["number"]}), utcnow()))
     return {"deleted": int(document_id)}
@@ -327,30 +419,126 @@ def issue_for_invoice(database, invoice_id, lines, user_id):
     brings the goods back in (Receipt), and a purchase credit note (goods returned to the supplier)
     sends them back out (Issue)."""
     with database.connect() as db:
-        invoice = db.execute("SELECT * FROM invoices WHERE id=?", (int(invoice_id),)).fetchone()
-        for old in db.execute("SELECT id FROM stock_documents WHERE invoice_id=?", (int(invoice_id),)).fetchall():
-            db.execute("DELETE FROM stock_movements WHERE document_id=?", (old["id"],)); db.execute("DELETE FROM stock_documents WHERE id=?", (old["id"],))
-    stock_lines = [{"sku": l.get("item_code") or l.get("sku"), "quantity": l.get("quantity"), "sales_price": l.get("unit_price")} for l in lines if l.get("item_code") or l.get("sku")]
-    if not stock_lines or not invoice: return None
-    returned = str((invoice["doc_subtype"] if "doc_subtype" in invoice.keys() else "") or "").endswith("credit_note")
-    issue = (invoice["kind"] == "sale") != returned  # a credit note reverses the normal direction
-    doc_type = "issue" if issue else "receipt"
-    header = {"doc_type": doc_type, "doc_date": invoice["invoice_date"], "warehouse_id": lines[0].get("warehouse") or "MAIN",
-              "party_id": invoice["party_id"], "invoice_id": int(invoice_id), "reference": invoice["invoice_number"], "notes": f"Invoice {invoice['invoice_number']}"}
-    source_lines = [l for l in lines if l.get("item_code") or l.get("sku")]
-    if doc_type == "receipt":
-        if invoice["kind"] != "sale":
-            # Purchase receipt: value the goods at the purchase price on the invoice line.
-            for line, source in zip(stock_lines, source_lines): line["unit_cost"] = source.get("unit_price")
-        else:
-            # Sales credit note (goods returned by the customer): bring them back at the current average cost.
-            state = run_costing(database, iso_date(invoice["invoice_date"]))
+        invoice=db.execute("SELECT * FROM invoices WHERE id=?",(int(invoice_id),)).fetchone()
+        if not invoice: return None
+        for old in db.execute("SELECT id FROM stock_documents WHERE invoice_id=?",(int(invoice_id),)).fetchall():
+            db.execute("DELETE FROM stock_movements WHERE document_id=?",(old["id"],))
+            db.execute("DELETE FROM stock_documents WHERE id=?",(old["id"],))
+        invoice=dict(invoice)
+        original_items=[dict(row) for row in db.execute("SELECT id,item_code,quantity,subtotal FROM invoice_items WHERE invoice_id=? ORDER BY id",(int(invoice_id),))]
+    returned=invoice.get("doc_subtype")=="credit_note"
+    is_sale=invoice["kind"]=="sale"
+    if returned and invoice.get("linked_invoice_id"):
+        if iso_date(invoice["invoice_date"])<iso_date(database.get_invoice(invoice["linked_invoice_id"])["invoice_date"]):
+            raise ValueError("A return cannot be backdated before its original invoice; doing so would rewrite historical stock costing")
+    indexed=[]
+    for pos,(source,line) in enumerate(zip(original_items,lines)):
+        code=line.get("item_code") or line.get("sku")
+        if code:
+            indexed.append({"sku":code,"quantity":line.get("quantity"),"sales_price":line.get("unit_price"),
+                            "invoice_item_id":line.get("origin_item_id") if returned else source["id"],
+                            "origin_item_id":line.get("origin_item_id") if returned else source["id"],"_source_item_id":source["id"],
+                            "_source_cost":_d(source.get("subtotal"))/_d(source.get("quantity") or 1),
+                            "unit_cost":0,"warehouse":line.get("warehouse") or "MAIN"})
+    if not indexed: return None
+    doc_type="issue" if (is_sale != returned) else "receipt"
+    target=database.get_invoice(invoice["linked_invoice_id"]) if returned and invoice.get("linked_invoice_id") else invoice
+    date=iso_date(invoice["invoice_date"])
+    header={"doc_type":doc_type,"doc_date":date,"warehouse_id":indexed[0]["warehouse"],
+        "party_id":invoice["party_id"],"invoice_id":int(invoice_id),"reference":invoice["invoice_number"],
+        "notes":f"Invoice {invoice['invoice_number']}",
+        "movement_type":"purchase_return" if returned and not is_sale else doc_type}
+    if doc_type=="receipt" and is_sale and not invoice.get("linked_invoice_id"):
+        # Older manually entered sales credit notes have no source invoice/item to
+        # recover costing layers from. Preserve their historical moving-average
+        # behavior, while requiring linked returns for FIFO where the layer cannot
+        # be established safely.
+        if settings(database)["method"]=="fifo":
+            raise ValueError("Link this sales credit note to its original invoice to restore FIFO stock safely")
+        state=run_costing(database,date)
+        for line in indexed:
             with database.connect() as db:
-                for line in stock_lines:
-                    found = db.execute("SELECT id FROM inventory_items WHERE sku=?", (str(line["sku"] or "").strip().upper(),)).fetchone()
-                    average = state.get(found["id"], {}).get("avg", ZERO) if found else ZERO
-                    line["unit_cost"] = float(average) if average and float(average) > 0 else float(_d(line.get("sales_price")))
-    return save_document(database, header, stock_lines, user_id)
+                item=db.execute("SELECT id FROM inventory_items WHERE sku=?",(str(line["sku"]).upper(),)).fetchone()
+            cost=_d(state.get(item["id"],{}).get("avg")) if item else ZERO
+            if cost<=0:
+                raise ValueError(f"Cannot establish a positive stock cost for unlinked credit-note item {line['sku']}")
+            line["unit_cost"]=cost
+            line["cost_layers"]=[{"quantity":str(_d(line["quantity"])),"unit_cost":str(cost)}]
+    if doc_type=="receipt" and is_sale and invoice.get("linked_invoice_id"):
+        # Reintroduce the exact cost layers consumed by the original sales issue. Never
+        # substitute today's average or the selling price for historical cost.
+        for line in indexed:
+            origin_id=int(line["origin_item_id"])
+            with database.connect() as db:
+                movements=[dict(r) for r in db.execute("""SELECT m.*,d.doc_date FROM stock_movements m JOIN stock_documents d ON d.id=m.document_id
+                    WHERE d.invoice_id=? AND m.quantity<0 AND (m.invoice_item_id=? OR (m.invoice_item_id IS NULL AND m.item_id=(SELECT id FROM inventory_items WHERE sku=?)))
+                    ORDER BY d.id,m.line_no,m.id""",(target["id"],origin_id,str(line["sku"]).upper()))]
+            if not movements: raise ValueError(f"Original stock issue for {line['sku']} was not found; return not posted")
+            selected=movements[0]
+            try: layers=json.loads(selected.get("cost_layers") or "[]")
+            except (TypeError,ValueError): layers=[]
+            if not layers:
+                captured={}
+                def capture(row,values):
+                    if row["id"]==selected["id"]: captured["layers"]=values
+                run_costing(database,iso_date(target["invoice_date"]),layers_callback=capture)
+                layers=captured.get("layers") or []
+                if not layers: raise ValueError(f"Original cost layers for {line['sku']} cannot be reconstructed safely")
+                with database.connect() as db:
+                    db.execute("UPDATE stock_movements SET cost_layers=? WHERE id=?",(json.dumps(layers),selected["id"]))
+            origin_detail=next((item for item in database.invoice_detail(target["id"])["items"] if int(item["id"])==origin_id),None)
+            prior=_d(origin_detail.get("returned_quantity") or 0) if origin_detail else ZERO
+            qty=_d(line["quantity"]); need=qty; remaining_layers=[{**part,"quantity":str(part.get("quantity"))} for part in layers]
+            # Existing active returns have consumed the first part of the original cost-layer sequence.
+            skip=prior; allocated=[]
+            for part in remaining_layers:
+                layer_qty=_d(part["quantity"]); cost=_d(part.get("unit_cost") or part.get("cost"))
+                if skip>=layer_qty: skip-=layer_qty; continue
+                available=layer_qty-skip; skip=ZERO
+                take=min(need,available)
+                if take:
+                    allocated.append({"quantity":str(take),"unit_cost":str(cost)}); need-=take
+                if not need: break
+            if need: raise ValueError(f"Return quantity for {line['sku']} exceeds the original issued cost layers")
+            line["cost_layers"]=allocated
+            line["unit_cost"]=sum((_d(p["quantity"])*_d(p["unit_cost"]) for p in allocated),ZERO)/qty
+    elif doc_type=="receipt" and not is_sale:
+        rate=Decimal(str(invoice.get("exchange_rate") or 0))
+        if rate<=0: raise ValueError("Invoice exchange rate must be a positive reviewed value")
+        for line in indexed:
+            source_line=next(item for item,original in zip(lines,original_items) if int(original["id"])==line["_source_item_id"])
+            line["unit_cost"]=_convert_inventory_cost(database,invoice,line["_source_cost"])
+    elif doc_type=="issue" and returned and not is_sale:
+        rate=Decimal(str(target.get("exchange_rate") or 0))
+        if rate<=0: raise ValueError("Original purchase exchange rate is invalid")
+        for line in indexed:
+            origin_id=int(line["origin_item_id"])
+            with database.connect() as db:
+                movement=db.execute("""SELECT m.*,d.doc_date FROM stock_movements m JOIN stock_documents d ON d.id=m.document_id
+                    WHERE d.invoice_id=? AND m.quantity>0 AND (m.invoice_item_id=? OR m.item_id=(SELECT id FROM inventory_items WHERE sku=?))
+                    ORDER BY d.id,m.line_no,m.id LIMIT 1""",(target["id"],origin_id,str(line["sku"]).upper())).fetchone()
+            if not movement: raise ValueError(f"Original purchase receipt for {line['sku']} was not found; return not posted")
+            cost=_d(movement["unit_cost"])
+            # Legacy receipts stored foreign currency values; convert from the original document's currency.
+            if str(target["currency"]).upper()!=settings(database)["currency"]:
+                origin_line=next((item for item in database.invoice_detail(target["id"])["items"] if int(item["id"])==origin_id),None)
+                if not origin_line: raise ValueError(f"Original purchase line for {line['sku']} was not found")
+                cost=_convert_inventory_cost(database,target,_d(origin_line.get("subtotal"))/_d(origin_line.get("quantity") or 1))
+            line["unit_cost"]=cost
+            line["movement_type"]="purchase_return"
+            line["cost_layers"]=[{"quantity":str(_d(line["quantity"])),"unit_cost":str(cost),
+                                  "source_document_id":movement["document_id"],"source_line_no":movement["line_no"]}]
+    saved=save_document(database,header,indexed,user_id)
+    if doc_type=="issue" and is_sale and not returned:
+        mapped={}
+        def capture(row,values):
+            if row["document_id"]==saved["id"]: mapped[row["line_no"]]=values
+        run_costing(database,date,layers_callback=capture)
+        with database.connect() as db:
+            for movement in db.execute("SELECT id,line_no FROM stock_movements WHERE document_id=?",(saved["id"],)).fetchall():
+                if movement["line_no"] in mapped:
+                    db.execute("UPDATE stock_movements SET cost_layers=? WHERE id=?",(json.dumps(mapped[movement["line_no"]]),movement["id"]))
+    return saved
 
 
 def remove_invoice_documents(db, invoice_id):
@@ -590,8 +778,8 @@ def carry_forward(source, target, year, user_id):
         for warehouse_id, qty in data["by_warehouse"].items():
             if qty <= 0: continue
             if method == "fifo":
-                for layer_qty, cost, _day in data["warehouse_layers"].get(warehouse_id, []):
-                    by_warehouse.setdefault(warehouse_id, []).append({"item_id": item_id, "quantity": layer_qty, "unit_cost": cost})
+                for layer in data["warehouse_layers"].get(warehouse_id, []):
+                    by_warehouse.setdefault(warehouse_id, []).append({"item_id": item_id, "quantity": layer[0], "unit_cost": layer[1]})
             else:
                 by_warehouse.setdefault(warehouse_id, []).append({"item_id": item_id, "quantity": qty, "unit_cost": data["avg"]})
     for warehouse_id, lines in by_warehouse.items():
@@ -881,7 +1069,7 @@ def _ageing_data(database, options, items, in_category, method, date_to):
         share = on_hand / data["qty"] if method != "fifo" else Decimal(1)  # average-cost warehouse age is estimated
         unit_cost = data["avg"]
         buckets = [[ZERO, ZERO] for _ in range(len(limits) + 1)]; weighted_age = ZERO; oldest = None
-        for qty, layer_cost, day in remaining:
+        for qty, layer_cost, day, *_origin in remaining:
             age = (as_of - datetime.strptime(day, "%Y-%m-%d")).days; qty = qty * share
             index = next((i for i, limit in enumerate(limits) if age <= limit), len(limits))
             value = qty * (layer_cost if method == "fifo" else unit_cost)

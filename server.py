@@ -110,6 +110,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self._json(200,info)
         if path == "/api/fixed-assets":
             return self._json(200,{"items":fixed_assets.list_assets(self.db)})
+        if path.startswith("/api/fixed-assets/") and path.endswith("/attachments"):
+            try: return self._json(200,{"items":fixed_assets.list_attachments(self.db,int(path.split("/")[-2]))})
+            except KeyError: return self._json(404,{"error":"Asset not found"})
+            except Exception as exc: return self._json(400,{"error":str(exc)})
+        if path.startswith("/api/fixed-asset-attachments/"):
+            try:
+                attachment=fixed_assets.get_attachment(self.db,int(path.rsplit("/",1)[-1]))
+                attachment["content"]=base64.b64encode(attachment["content"]).decode("ascii")
+                return self._json(200,attachment)
+            except KeyError: return self._json(404,{"error":"Asset attachment not found"})
+            except Exception as exc: return self._json(400,{"error":str(exc)})
         if path == "/api/fixed-assets/rollforward":
             try: return self._json(200,fixed_assets.rollforward(self.db,self._query(parsed,"year","")))
             except Exception as exc: return self._json(400,{"error":str(exc)})
@@ -444,6 +455,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         if path == "/api/fixed-assets":
             try: return self._json(201,{"asset":fixed_assets.save_asset(self.db,body,user_id=user["id"])})
             except Exception as exc: return self._json(400,{"error":str(exc)})
+        if path.startswith("/api/fixed-assets/") and path.endswith("/attachments"):
+            try:
+                raw=base64.b64decode((body.get("content") or "").encode("ascii"),validate=True)
+                result=fixed_assets.add_attachment(self.db,int(path.split("/")[-2]),body.get("file_name"),
+                                                   body.get("mime_type"),raw,user["id"])
+                return self._json(200 if result["duplicate"] else 201,result)
+            except KeyError: return self._json(404,{"error":"Asset not found"})
+            except Exception as exc: return self._json(400,{"error":str(exc)})
         if path.startswith("/api/fixed-assets/") and path.endswith("/post"):
             try: return self._json(201,{"voucher":fixed_assets.post_period(self.db,int(path.split("/")[-2]),body.get("period_end"),user["id"],self.headers.get("X-Fiscal-Year"))})
             except Exception as exc: return self._json(400,{"error":str(exc)})
@@ -455,6 +474,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             except Exception as exc: return self._json(400,{"error":str(exc)})
         if path.startswith("/api/invoices/") and path.endswith("/replace"):
             try: return self._json(200,{"invoice_id":self.db.replace_manual_invoice(int(path.split("/")[-2]),body.get("invoice",{}),body.get("items",[]),user["id"])})
+            except KeyError: return self._json(404,{"error":"Invoice not found"})
+            except Exception as exc: return self._json(400,{"error":str(exc)})
+        if path.startswith("/api/invoices/") and path.endswith("/returns"):
+            try:
+                result=self.db.create_invoice_return(int(path.split("/")[-2]),body.get("items",[]),body.get("return_date"),user["id"],body.get("request_id"))
+                return self._json(201,{"invoice":result})
             except KeyError: return self._json(404,{"error":"Invoice not found"})
             except Exception as exc: return self._json(400,{"error":str(exc)})
         if path.startswith("/api/invoices/") and path.endswith("/landed-cost"):

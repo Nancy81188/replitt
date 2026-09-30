@@ -126,6 +126,14 @@ class PayrollOfficialReportsTest(unittest.TestCase):
 
 
 class LongReportExportTest(unittest.TestCase):
+    def test_excel_export_rejects_values_without_a_header(self):
+        sections = [{"heading": "Unmatched row", "headers": ["Account", "Balance"],
+                     "rows": [["100", "25.00", "UNLABELED"]]}]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "invalid.xlsx"
+            with self.assertRaisesRegex(ValueError, "Section 'Unmatched row' has more values than headers"):
+                export_sections_excel(path, "Unmatched report", [], sections)
+
     def test_wide_multilingual_report_keeps_every_row_and_total(self):
         import unicodedata
         from report_export import _formatted

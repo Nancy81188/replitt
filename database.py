@@ -481,6 +481,11 @@ class Database:
             inv_cols={row["name"] for row in db.execute("PRAGMA table_info(invoices)")}
             for column,definition in (("doc_subtype","TEXT NOT NULL DEFAULT 'invoice'"),("invoice_discount_percent","TEXT"),("invoice_discount_amount","TEXT"),("gross_before_discount","TEXT"),("notes","TEXT")):
                 if column not in inv_cols: db.execute(f"ALTER TABLE invoices ADD COLUMN {column} {definition}")
+            if "return_request_id" not in inv_cols: db.execute("ALTER TABLE invoices ADD COLUMN return_request_id TEXT")
+            if "return_request_hash" not in inv_cols: db.execute("ALTER TABLE invoices ADD COLUMN return_request_hash TEXT")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_invoice_return_request ON invoices(return_request_id) WHERE return_request_id IS NOT NULL")
+            item_cols={row["name"] for row in db.execute("PRAGMA table_info(invoice_items)")}
+            if "origin_item_id" not in item_cols: db.execute("ALTER TABLE invoice_items ADD COLUMN origin_item_id INTEGER")
             db.execute("""CREATE TABLE IF NOT EXISTS payment_allocations (id INTEGER PRIMARY KEY, payment_id INTEGER NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
                 invoice_id INTEGER NOT NULL, amount TEXT NOT NULL, created_at TEXT NOT NULL)""")
             # new default posting accounts for payroll (only where the old defaults were never changed)
@@ -1136,6 +1141,8 @@ class Database:
         with self.connect() as db:
             if str(invoice.get("source_file") or "")=="Journal Voucher":
                 db.execute("UPDATE journal_entries SET source_type='journal_voucher' WHERE source_type='invoice' AND source_id=?",(invoice_id,))
+            if invoice.get("linked_invoice_id"):
+                db.execute("UPDATE invoices SET linked_invoice_id=? WHERE id=?",(int(invoice["linked_invoice_id"]),invoice_id))
             db.executemany("""INSERT INTO invoice_items(invoice_id,description,quantity,unit_price,subtotal,deductible_subtotal,non_deductible_subtotal,vat_rate,vat,total,item_code)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?)""", [
                 (invoice_id,description,str(quantity),str(unit_price),str(subtotal),str(deductible),str(non_deductible),str(vat_rate),str(vat),str(total),item_code)
@@ -1152,22 +1159,37 @@ class Database:
         # Preserve the supplier's invoiced VAT for the quarterly declaration.
         # An exempt-use purchase has no input deduction: transfer that VAT from
         # the receivable account into cost with a separate balanced entry.
-        if self._entry_type(invoice) != "sales" and invoice.get("vat_use") == "exempt" and vat_total:
+        if self._entry_type(invoice) != "sales" and invoice.get("vat_use") == "exempt" and vat_total and not invoice.get("skip_vat_reclass"):
             try: self.set_vat_recoverable("invoice", invoice_id, False, user_id)
             except Exception:
                 self.delete_invoice(invoice_id, user_id); raise
         return invoice_id
 
+    @staticmethod
+    def _assert_no_active_linked_returns(db,invoice_id,action):
+        linked=db.execute("""SELECT invoice_number FROM invoices WHERE linked_invoice_id=?
+            AND doc_subtype='credit_note' AND status NOT IN ('cancelled','deleted') LIMIT 1""",(int(invoice_id),)).fetchone()
+        if linked:
+            raise ValueError(f"Cannot {action} this invoice while active linked credit note {linked['invoice_number']} exists; cancel that credit note first")
+
+    @staticmethod
+    def _assert_credit_note_not_edited(db,invoice_id):
+        row=db.execute("SELECT doc_subtype,status FROM invoices WHERE id=?",(int(invoice_id),)).fetchone()
+        if row and row["doc_subtype"]=="credit_note" and row["status"] not in ("cancelled","deleted"):
+            raise ValueError("A posted credit note cannot be edited; cancel it and create a new reviewed return instead")
+
     def delete_invoice(self,invoice_id,user_id):
         with self.connect() as db:
             invoice=db.execute("SELECT * FROM invoices WHERE id=?",(int(invoice_id),)).fetchone()
             if not invoice: raise KeyError(invoice_id)
+            self._assert_no_active_linked_returns(db,invoice_id,"delete")
             self._assert_period_open(invoice["invoice_date"])
             details=dict(invoice)
             db.execute("DELETE FROM journal_entries WHERE source_type IN ('invoice','journal_voucher') AND source_id=?",(int(invoice_id),))
             db.execute("DELETE FROM journal_entries WHERE source_type='vat_reclass' AND entry_number=?",(f"VATND-INV-{int(invoice_id)}",))
             import inventory
             inventory.remove_invoice_documents(db,invoice_id)
+            inventory._assert_nonnegative_history(db)
             db.execute("DELETE FROM invoices WHERE id=?",(int(invoice_id),))
             db.execute("INSERT INTO audit_log(user_id,action,entity,entity_id,details,created_at) VALUES(?,?,?,?,?,?)",
                 (user_id,"delete","invoice",int(invoice_id),json.dumps({"invoice_number":details.get("invoice_number"),"party_id":details.get("party_id"),"total":details.get("total")}),utcnow()))
@@ -1179,6 +1201,7 @@ class Database:
             invoice=db.execute("SELECT * FROM invoices WHERE id=?",(int(invoice_id),)).fetchone()
             if not invoice: raise KeyError(invoice_id)
             if invoice["status"]=="deleted": raise ValueError("Invoice is already deleted")
+            self._assert_no_active_linked_returns(db,invoice_id,"delete")
             self._assert_period_open(invoice["invoice_date"])
             if db.execute("SELECT 1 FROM payment_allocations WHERE invoice_id=? LIMIT 1",(int(invoice_id),)).fetchone():
                 raise ValueError("Invoice has allocated payments. Remove the allocation before deleting it")
@@ -1186,6 +1209,7 @@ class Database:
                 raise ValueError("Invoice has linked documents. Resolve them before deleting it")
             import inventory
             inventory.remove_invoice_documents(db,invoice_id)
+            inventory._assert_nonnegative_history(db)
             db.execute("DELETE FROM journal_entries WHERE source_type IN ('invoice','journal_voucher','invoice_reversal') AND source_id=?",(int(invoice_id),))
             db.execute("DELETE FROM journal_entries WHERE source_type='vat_reclass' AND entry_number=?",(f"VATND-INV-{int(invoice_id)}",))
             db.execute("UPDATE invoices SET status='deleted',cancelled_at=?,cancellation_reason='Deleted' WHERE id=?",(utcnow(),int(invoice_id)))
@@ -1480,6 +1504,8 @@ class Database:
                 raise KeyError(invoice_id)
             if existing["status"] in ("cancelled","deleted"):
                 raise ValueError("Cancelled or deleted invoices cannot be edited")
+            self._assert_credit_note_not_edited(db,invoice_id)
+            self._assert_no_active_linked_returns(db,invoice_id,"edit")
             party_kind = "customer" if kind == "sale" else "supplier"
             party_name = str(item["party_name"]).strip()
             db.execute("INSERT OR IGNORE INTO parties(kind,name,currency) VALUES(?,?,?)", (party_kind, party_name, currency))
@@ -1591,6 +1617,7 @@ class Database:
                 raise KeyError(invoice_id)
             if invoice["status"] in ("cancelled","deleted"):
                 raise ValueError("Cancelled or deleted invoices cannot be cancelled again")
+            self._assert_no_active_linked_returns(db,invoice_id,"cancel")
             self._assert_period_open(invoice["invoice_date"])
             original = db.execute("SELECT * FROM journal_entries WHERE source_type IN ('invoice','journal_voucher') AND source_id=?", (invoice_id,)).fetchone()
             if not original:
@@ -1608,6 +1635,7 @@ class Database:
             db.execute("DELETE FROM journal_entries WHERE source_type='vat_reclass' AND entry_number=?",(f"VATND-INV-{int(invoice_id)}",))
             import inventory
             inventory.remove_invoice_documents(db,invoice_id)
+            inventory._assert_nonnegative_history(db)
             db.execute("INSERT INTO audit_log(user_id,action,entity,entity_id,details,created_at) VALUES(?,?,?,?,?,?)",
                        (user_id,"cancel","invoice",invoice_id,json.dumps({"reason":reason}),utcnow()))
         return self.get_invoice(invoice_id)
@@ -1645,8 +1673,122 @@ class Database:
     def invoice_detail(self, invoice_id):
         invoice=self.get_invoice(invoice_id)
         with self.connect() as db:
-            items=[dict(row) for row in db.execute("SELECT description,quantity,unit_price,subtotal,deductible_subtotal,non_deductible_subtotal,vat_rate,vat,total,item_code,unit,discount_percent,discount_amount,gross_amount FROM invoice_items WHERE invoice_id=? ORDER BY id",(invoice_id,))]
+            items=[dict(row) for row in db.execute("""SELECT ii.id,ii.description,ii.quantity,ii.unit_price,ii.subtotal,ii.deductible_subtotal,ii.non_deductible_subtotal,
+                ii.vat_rate,ii.vat,ii.total,ii.item_code,ii.unit,ii.discount_percent,ii.discount_amount,ii.gross_amount,
+                COALESCE((SELECT SUM(CAST(ret.quantity AS REAL)) FROM invoice_items ret JOIN invoices ri ON ri.id=ret.invoice_id
+                    WHERE ri.linked_invoice_id=? AND ri.status NOT IN ('cancelled','deleted') AND ret.origin_item_id=ii.id),0) returned_quantity,
+                COALESCE((SELECT SUM(CAST(ret.deductible_subtotal AS REAL)) FROM invoice_items ret JOIN invoices ri ON ri.id=ret.invoice_id
+                    WHERE ri.linked_invoice_id=? AND ri.status NOT IN ('cancelled','deleted') AND ret.origin_item_id=ii.id),0) returned_deductible_subtotal,
+                COALESCE((SELECT SUM(CAST(ret.non_deductible_subtotal AS REAL)) FROM invoice_items ret JOIN invoices ri ON ri.id=ret.invoice_id
+                    WHERE ri.linked_invoice_id=? AND ri.status NOT IN ('cancelled','deleted') AND ret.origin_item_id=ii.id),0) returned_non_deductible_subtotal,
+                COALESCE((SELECT SUM(CAST(ret.vat AS REAL)) FROM invoice_items ret JOIN invoices ri ON ri.id=ret.invoice_id
+                    WHERE ri.linked_invoice_id=? AND ri.status NOT IN ('cancelled','deleted') AND ret.origin_item_id=ii.id),0) returned_vat
+                FROM invoice_items ii WHERE ii.invoice_id=? ORDER BY ii.id""",(invoice_id,invoice_id,invoice_id,invoice_id,invoice_id))]
         return {"invoice":invoice,"items":items}
+
+    def create_invoice_return(self, invoice_id, returns, return_date, user_id, request_id):
+        request_id=str(request_id or "").strip()
+        if not request_id or len(request_id)>128:
+            raise ValueError("A stable return request ID is required")
+        request_hash=hashlib.sha256(json.dumps({"invoice_id":int(invoice_id),"items":returns,"return_date":return_date},
+            sort_keys=True,separators=(",",":"),default=str).encode("utf-8")).hexdigest()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            previous=db.execute("SELECT * FROM invoices WHERE return_request_id=?",(request_id,)).fetchone()
+            if previous:
+                if int(previous["linked_invoice_id"] or 0)!=int(invoice_id):
+                    raise ValueError("This return request ID was already used for a different invoice")
+                if previous["return_request_hash"]!=request_hash:
+                    raise ValueError("This return request ID was already used with different return details")
+                return self.get_invoice(previous["id"])
+            return self._create_invoice_return_locked(invoice_id,returns,return_date,user_id,request_id,request_hash)
+
+    def _create_invoice_return_locked(self, invoice_id, returns, return_date, user_id, request_id, request_hash):
+        """Post a linked credit note for reviewed quantities; never create a payment or allocation."""
+        from decimal import ROUND_HALF_UP
+        source=self.get_invoice(int(invoice_id))
+        if source.get("status")!="posted":
+            raise ValueError("Returns can only be created from a posted invoice")
+        if source.get("doc_subtype")=="credit_note":
+            raise ValueError("A credit note cannot itself be returned")
+        try:
+            source_exchange_rate=Decimal(str(source.get("exchange_rate") or "0"))
+            if not source_exchange_rate.is_finite() or source_exchange_rate<=0: raise ValueError
+        except Exception as exc:
+            raise ValueError("The original invoice has no valid positive exchange rate; return not posted") from exc
+        originals=self.invoice_detail(int(invoice_id))["items"]
+        if not originals: raise ValueError("This invoice has no item lines to return; no return was created")
+        with self.connect() as db:
+            stock_source=db.execute("""SELECT w.code FROM stock_documents d JOIN warehouses w ON w.id=d.warehouse_id
+                WHERE d.invoice_id=? ORDER BY d.id DESC LIMIT 1""",(int(invoice_id),)).fetchone()
+        warehouse_code=stock_source["code"] if stock_source else "MAIN"
+        if not isinstance(returns,list) or not returns: raise ValueError("Select at least one return quantity")
+        by_id={int(row["id"]):row for row in originals}; requested={}
+        for row in returns:
+            try:
+                item_id=int(row["item_id"]); qty=Decimal(str(row["quantity"]))
+            except Exception as exc:
+                raise ValueError("Return lines need a valid invoice item and quantity") from exc
+            if item_id not in by_id or qty<=0:
+                raise ValueError("Return quantities must be positive and belong to the original invoice")
+            if item_id in requested: raise ValueError("A return line may only be selected once")
+            original=by_id[item_id]
+            remaining=Decimal(str(original["quantity"]))-Decimal(str(original["returned_quantity"] or 0))
+            if qty>remaining: raise ValueError(f"{original['description']}: only {remaining} remains returnable")
+            requested[item_id]=qty
+        cent=Decimal("0.01"); micro=Decimal("0.000001"); lines=[]
+        for item_id,qty in requested.items():
+            original=by_id[item_id]
+            remaining_qty=Decimal(str(original["quantity"]))-Decimal(str(original["returned_quantity"] or 0))
+            ratio=qty/remaining_qty
+            def part(field):
+                remainder=Decimal(str(original.get(field) or 0))-Decimal(str(original.get("returned_"+field) or 0))
+                return (remainder*ratio).quantize(cent,rounding=ROUND_HALF_UP)
+            deductible=part("deductible_subtotal"); non_deductible=part("non_deductible_subtotal"); vat=part("vat")
+            price=(deductible+non_deductible)/qty
+            lines.append({"description":original["description"],"quantity":str(qty),
+                "unit_price":str(price.quantize(micro,rounding=ROUND_HALF_UP)),
+                "deductible_subtotal":str(deductible),"non_deductible_subtotal":str(non_deductible),
+                "vat_rate":str(original["vat_rate"]),"vat":str(vat),"item_code":original.get("item_code"),
+                "unit":original.get("unit"),"discount_percent":"0","warehouse":warehouse_code,"origin_item_id":item_id})
+        is_sale=source["kind"]=="sale"; date=iso_date(return_date or source["invoice_date"],"Return date")
+        def opposite(side,default):
+            return "C" if str(side or default).upper()=="D" else "D"
+        invoice={"invoice_number":self.next_invoice_number("credit_note" if is_sale else "supplier_credit_note",date),
+            "invoice_date":date,"party_name":source["party_name"],"kind":"sales" if is_sale else "purchases",
+            "currency":source["currency"],"exchange_rate":str(source_exchange_rate),"status":"posted","source_file":"Sales Return" if is_sale else "Purchase Return",
+            "supplier_account":source["supplier_account"],"vat_account":source["vat_account"],
+            "expense_account":source["expense_account"],"expense_no_vat_account":source.get("expense_no_vat_account"),
+            "supplier_side":opposite(source.get("supplier_side"),"D" if is_sale else "C"),
+            "vat_side":opposite(source.get("vat_side"),"C" if is_sale else "D"),
+            "expense_side":opposite(source.get("expense_side"),"C" if is_sale else "D"),
+            "expense_no_vat_side":opposite(source.get("expense_no_vat_side"),"D"),
+            "vat_treatment":source.get("vat_treatment") or "standard","vat_use":source.get("vat_use") or "mixed",
+            "doc_subtype":"credit_note","amount_paid":"0","payment_method":"On Account (Not Cash)",
+            "notes":f"Return against {source['invoice_number']}","skip_vat_reclass":True,
+            "branch":source.get("branch_name"),"department_id":source.get("department_id"),"project_id":source.get("project_id"),
+            "linked_invoice_id":int(invoice_id)}
+        created=self.create_manual_invoice(invoice,lines,user_id)
+        with self.connect() as db:
+            db.execute("UPDATE invoices SET linked_invoice_id=?,return_request_id=?,return_request_hash=? WHERE id=?",
+                       (int(invoice_id),request_id,request_hash,created))
+            created_item_ids=[row["id"] for row in db.execute("SELECT id FROM invoice_items WHERE invoice_id=? ORDER BY id",(created,))]
+            for item_id,line in zip(created_item_ids,lines):
+                db.execute("UPDATE invoice_items SET origin_item_id=? WHERE id=?",(line["origin_item_id"],item_id))
+            returned_vat=sum(Decimal(str(line["vat"])) for line in lines)
+            if not is_sale and not source.get("vat_recoverable",1):
+                # Reverse the original non-deductible VAT reclassification (Dr VAT / Cr cost).
+                db.execute("UPDATE invoices SET vat_recoverable=0 WHERE id=?",(created,))
+                if returned_vat:
+                    row=db.execute("SELECT party_id,branch_id,currency,invoice_date,expense_account,vat_account FROM invoices WHERE id=?",(created,)).fetchone()
+                    entry=db.execute("""INSERT INTO journal_entries(entry_number,entry_date,description,source_type,source_id,currency,branch_id,created_by,created_at)
+                        VALUES(?,?,?,?,?,?,?,?,?)""",(f"VATND-INV-{created}",row["invoice_date"],f"Reverse non-deductible VAT {source['invoice_number']}",
+                        "vat_reclass",created,row["currency"],row["branch_id"],user_id,utcnow())).lastrowid
+                    for code,debit,credit in ((row["vat_account"],returned_vat,Decimal("0")),(row["expense_account"],Decimal("0"),returned_vat)):
+                        db.execute("INSERT INTO journal_lines(entry_id,account_id,party_id,description,debit,credit) VALUES(?,?,?,?,?,?)",
+                            (entry,self._account_id(db,code),row["party_id"],"Reverse non-deductible VAT reclassification",str(debit),str(credit)))
+        self._store_invoice_format(created,invoice,lines)
+        return self.get_invoice(created)
 
     def add_attachment(self, invoice_id, file_name, mime_type, content, user_id):
         if not file_name or not content:
@@ -2273,7 +2415,7 @@ class Database:
 
     def list_invoices(self, limit=500):
         with self.connect() as db:
-            return [dict(r) for r in db.execute("""SELECT i.id,i.invoice_number,i.invoice_date,p.name party_name,i.kind,i.entry_type,i.currency,i.subtotal,i.deductible_subtotal,i.non_deductible_subtotal,i.vat,i.total,
+            return [dict(r) for r in db.execute("""SELECT i.id,i.invoice_number,i.invoice_date,p.name party_name,i.kind,i.entry_type,i.currency,i.exchange_rate,i.subtotal,i.deductible_subtotal,i.non_deductible_subtotal,i.vat,i.total,
                 CASE WHEN i.status='deleted' THEN 0 ELSE COALESCE(CAST(i.debit_override AS REAL),CASE WHEN i.kind='sale' THEN CAST(i.total AS REAL) ELSE 0 END) END debit,
                 CASE WHEN i.status='deleted' THEN 0 ELSE COALESCE(CAST(i.credit_override AS REAL),CASE WHEN i.kind='purchase' THEN CAST(i.total AS REAL) ELSE 0 END) END credit,
                 i.status,i.currency_issue,i.supplier_account,i.vat_account,i.expense_account,i.expense_no_vat_account,
@@ -2281,7 +2423,7 @@ class Database:
                 i.due_date,i.payment_status,CAST(i.amount_paid AS REAL) amount_paid,i.payment_method,i.description,i.branch_id,COALESCE(b.name,'Head Office') branch_name,
                 CAST(i.total AS REAL)-CAST(i.amount_paid AS REAL) outstanding,i.cancelled_at,i.cancellation_reason,
                 (SELECT COUNT(*) FROM invoice_attachments x WHERE x.invoice_id=i.id) attachment_count,i.vat_recoverable,i.department_id,i.project_id,i.vat_treatment,i.vat_use,
-                i.doc_subtype,i.invoice_discount_percent,i.invoice_discount_amount,i.notes
+                i.doc_subtype,i.invoice_discount_percent,i.invoice_discount_amount,i.notes,i.linked_invoice_id
                 FROM invoices i LEFT JOIN parties p ON p.id=i.party_id LEFT JOIN branches b ON b.id=i.branch_id ORDER BY i.id DESC LIMIT ?""", (limit,))]
 
     def list_accounts(self):
@@ -3311,6 +3453,8 @@ class Database:
             old = db.execute("SELECT * FROM invoices WHERE id=?", (int(invoice_id),)).fetchone()
             if not old: raise KeyError("Invoice not found")
             if old["status"] in ("deleted","cancelled"): raise ValueError("Deleted or cancelled invoices cannot be edited")
+            self._assert_credit_note_not_edited(db,invoice_id)
+            self._assert_no_active_linked_returns(db,invoice_id,"edit")
             files = [dict(r) for r in db.execute("SELECT file_name,mime_type,content FROM invoice_attachments WHERE invoice_id=?", (int(invoice_id),))]
             linked = [r["id"] for r in db.execute("SELECT id FROM invoices WHERE linked_invoice_id=?", (int(invoice_id),))]
             self._assert_period_open(old["invoice_date"])
