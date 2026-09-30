@@ -92,6 +92,20 @@ class OcrPageTests(unittest.TestCase):
         self.assertTrue(result["ocr_used"])
         self.assertIn("please check", result["notes"])
 
+    def test_incomplete_nonempty_text_layer_falls_back_to_ocr(self):
+        text_layer = "Supplier Company address and registration information, but no invoice fields."
+        extracted = ("Invoice No: INV-45\nDate: 15/03/2026\nSupplier Co\n"
+                     "Subtotal: 100.00\nVAT: 11.00\nGrand Total: 111.00")
+        with patch("pdf_import.pdf_text", return_value=text_layer), patch(
+                "pdf_import._ocr_pdf", return_value=extracted) as ocr:
+            result = read_invoice_pdf("weak-text-layer.pdf")
+
+        ocr.assert_called_once()
+        self.assertEqual((result["invoice_number"], result["invoice_date"], result["total"]),
+                         ("INV-45", "15-03-2026", 111.0))
+        self.assertTrue(result["ocr_used"])
+        self.assertIn("Local English/Arabic OCR suggestion", result["notes"])
+
     def test_arabic_scanned_invoice_amounts_are_review_suggestions(self):
         extracted = ("فاتورة رقم: 45\nالتاريخ: 15/03/2026\nشركة المورد\n"
                      "المجموع الفرعي: ١٠٠٫٠٠\nضريبة القيمة المضافة: ١١٫٠٠\n"
@@ -144,6 +158,20 @@ class OcrPageTests(unittest.TestCase):
         self.assertEqual(_parse_invoice_text(
             "arabic.pdf", text.replace("إجمالي الفاتورة", "المبلغ المستحق"))["total"], 1332.55)
 
+    def test_arabic_item_rows_with_arabic_digits_are_parsed(self):
+        text = ("فاتورة رقم 45\nالتاريخ 15/03/2026\n"
+                "قهوة عربية ٢ ١٠٠٫٠٠ ٢٠٠٫٠٠")
+
+        parsed = _parse_invoice_text("arabic.pdf", text)
+
+        self.assertEqual(parsed["items"], [{
+            "description": "قهوة عربية",
+            "quantity": 2.0,
+            "unit_price": 100.0,
+            "total": 200.0,
+            "unit": "unit",
+        }])
+
     def test_arabic_missing_amounts_and_tax_rate_are_not_inferred(self):
         header = "فاتورة رقم 45\nالتاريخ 15/03/2026\n"
         subtotal_vat = _parse_invoice_text(
@@ -189,6 +217,26 @@ class OcrPageTests(unittest.TestCase):
             results = read_invoice_pdf_pages(Path("scan.pdf"))
 
         self.assertEqual(len(results), 1)
+        self.assertTrue(results[0]["ocr_used"])
+        self.assertIn("Local OCR suggestion", results[0]["notes"])
+
+    def test_multi_page_reader_ocr_retries_nonempty_but_incomplete_text(self):
+        fake_pypdf = types.ModuleType("pypdf")
+
+        class WeakTextPage:
+            def extract_text(self):
+                return "Supplier address and document footer with no recognized invoice fields."
+
+        fake_pypdf.PdfReader = lambda _path: types.SimpleNamespace(pages=[WeakTextPage()])
+        extracted = ("Invoice No: 46\nDate: 16/03/2026\nSupplier Co\n"
+                     "Subtotal: 200.00\nVAT: 22.00\nGrand Total: 222.00")
+        with patch.dict(sys.modules, {"pypdf": fake_pypdf}), patch(
+                "pdf_import._ocr_pdf_pages", return_value=[extracted]) as ocr:
+            results = read_invoice_pdf_pages(Path("weak-text-layer.pdf"))
+
+        ocr.assert_called_once_with(Path("weak-text-layer.pdf"), [0])
+        self.assertEqual(len(results), 1)
+        self.assertEqual((results[0]["invoice_number"], results[0]["total"]), ("46", 222.0))
         self.assertTrue(results[0]["ocr_used"])
         self.assertIn("Local OCR suggestion", results[0]["notes"])
 

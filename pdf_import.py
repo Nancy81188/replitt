@@ -90,6 +90,16 @@ def _ocr_pdf(path, page_numbers=None):
     return "\n".join(_ocr_pdf_pages(path, page_numbers))
 
 
+def _invoice_text_needs_ocr(path, text):
+    """Retry weak text layers with OCR instead of treating any extracted text as usable."""
+    if len((text or "").strip()) < 20:
+        return True
+    parsed = _parse_invoice_text(path, text)
+    return parsed.get("total") is None or (
+        not parsed.get("invoice_number") and not parsed.get("invoice_date")
+    )
+
+
 def _number(text):
     try: return float(str(text).replace(",", "").replace(" ", ""))
     except ValueError: return None
@@ -186,7 +196,7 @@ def _line_items(text):
         rf"(?P<unit_price>{number})\s+(?P<total>{number})\s*$"
     )
     for raw in text.splitlines():
-        line = " ".join(raw.split())
+        line = " ".join(_normalize_amount_line(raw).split())
         if len(line) < 5 or ignored.search(line):
             continue
         match = row_pattern.match(line)
@@ -242,22 +252,48 @@ def suggest_invoice_type(text):
 def read_invoice_pdf(path):
     """Best guess of invoice number, date, party, currency and amounts. Always review before saving."""
     path = Path(path)
-    try: text = pdf_text(path)
-    except Exception as exc: return {"file": path.name, "path": str(path), "text": "", "notes": f"The PDF could not be read ({exc}). Enter the details manually."}
-    ocr_note = ""
-    if len(text.strip()) < 20:
-        try:
-            text = _ocr_pdf(path)
-            ocr_note = ("Local English/Arabic OCR suggestion - please check" if text.strip()
-                        else "Local OCR found no readable text")
-        except Exception as exc:
-            ocr_note = f"Local OCR unavailable ({exc})"
+    text_error = ""
+    try:
+        text = pdf_text(path)
+    except Exception as exc:
+        text = ""
+        text_error = str(exc)
     result = _parse_invoice_text(path, text)
-    if ocr_note:
-        result["ocr_used"] = bool(text.strip())
-        result["notes"] = (ocr_note + "; " + result["notes"]) if result["notes"] else ocr_note
-        if result["ocr_used"]:
-            _warn_on_invoice_total_mismatch(result)
+    if not _invoice_text_needs_ocr(path, text):
+        if text_error:
+            result["notes"] = f'{result["notes"]}; PDF text extraction failed ({text_error})'.strip("; ")
+        return result
+
+    try:
+        ocr_text = _ocr_pdf(path)
+    except Exception as exc:
+        result["ocr_used"] = False
+        ocr_note = f"Local OCR unavailable ({exc})"
+        if text_error:
+            ocr_note += f"; PDF text extraction failed ({text_error})"
+        result["notes"] = f'{result.get("notes", "")}; {ocr_note}'.strip("; ")
+        return result
+
+    if not ocr_text.strip():
+        result["ocr_used"] = False
+        ocr_note = "Local OCR found no readable text"
+        if text_error:
+            ocr_note += f"; PDF text extraction failed ({text_error})"
+        result["notes"] = f'{result.get("notes", "")}; {ocr_note}'.strip("; ")
+        return result
+
+    ocr_result = _parse_invoice_text(path, ocr_text)
+    result = _merge_invoice_suggestions(result, ocr_result)
+    combined_text = "\n".join(part for part in (text.strip(), ocr_text.strip()) if part)
+    result["text"] = combined_text
+    result["ocr_used"] = True
+    prefix = "Local English/Arabic OCR suggestion - please check"
+    if len(text.strip()) < 20:
+        prefix = "Scanned PDF; " + prefix
+    if text_error:
+        prefix += f"; PDF text extraction failed ({text_error})"
+    result["notes"] = _invoice_notes(result, combined_text, prefix=prefix)
+    _warn_on_invoice_total_mismatch(result)
     return result
 
 
@@ -320,14 +356,38 @@ def _parse_invoice_text(path, text):
     result["acquisition_cost"] = result["subtotal"]
     if result["acquisition_cost"] is None and result["vat"] == 0:
         result["acquisition_cost"] = result["total"]
-    missing = [label for key, label in (("invoice_number", "number"), ("invoice_date", "date"), ("total", "total")) if not result.get(key)]
-    result["notes"] = "Read from PDF - please check" + (f"; not found: {', '.join(missing)}" if missing else "")
-    if result["vat"] is None and any(re.search(r"\b(?:vat|tva|tax)\b|ض\.ق\.م|ضريبة", line, re.I)
-                                       for line in text.splitlines()):
-        result["notes"] += "; VAT amount not found; enter or confirm it manually"
-    if result["items"]:
-        result["notes"] += f"; {len(result['items'])} item row(s) pre-filled for review"
+    result["notes"] = _invoice_notes(result, text)
     return result
+
+
+def _merge_invoice_suggestions(primary, fallback):
+    """Fill gaps from OCR while keeping values read from the PDF text layer preferred."""
+    result = dict(primary)
+    for key in ("invoice_number", "invoice_date", "party_name", "currency", "subtotal", "vat",
+                "total", "items", "suggested_type", "asset_name", "acquisition_cost"):
+        value = result.get(key)
+        if value is None or value == "" or value == []:
+            replacement = fallback.get(key)
+            if replacement is not None and replacement != "" and replacement != []:
+                result[key] = replacement
+    return result
+
+
+def _invoice_notes(result, text, prefix=""):
+    missing = [label for key, label in (("invoice_number", "number"), ("invoice_date", "date"),
+                                        ("total", "total")) if not result.get(key)]
+    notes = []
+    if prefix:
+        notes.append(prefix)
+    notes.append("Read from PDF - please check" +
+                 (f"; not found: {', '.join(missing)}" if missing else ""))
+    if result.get("vat") is None and any(
+            re.search(r"\b(?:vat|tva|tax)\b|ض\.ق\.م|ضريبة", line, re.I)
+            for line in text.splitlines()):
+        notes.append("VAT amount not found; enter or confirm it manually")
+    if result.get("items"):
+        notes.append(f"{len(result['items'])} item row(s) pre-filled for review")
+    return "; ".join(notes)
 
 
 def asset_pdf_details(data):
@@ -358,20 +418,23 @@ def read_invoice_pdf_pages(path):
     path = Path(path)
     reader = PdfReader(str(path))
     page_texts = [page.extract_text() or "" for page in reader.pages]
-    blank_pages = [index for index, text in enumerate(page_texts) if len(text.strip()) < 20]
+    blank_pages = {index for index, text in enumerate(page_texts) if len(text.strip()) < 20}
+    ocr_candidate_pages = [
+        index for index, text in enumerate(page_texts)
+        if _invoice_text_needs_ocr(path, text)
+    ]
     ocr_error = ""
-    if blank_pages:
+    ocr_pages = set()
+    if ocr_candidate_pages:
         try:
-            for index, text in zip(blank_pages, _ocr_pdf_pages(path, blank_pages)):
+            for index, text in zip(ocr_candidate_pages, _ocr_pdf_pages(path, ocr_candidate_pages)):
                 if text.strip():
                     page_texts[index] = text
+                    ocr_pages.add(index + 1)
         except Exception as exc:
-            ocr_error = f"; local OCR unavailable ({exc})"
+            ocr_error = str(exc)
     groups = []
-    ocr_pages = set()
     for number, text in enumerate(page_texts, 1):
-        if number - 1 in blank_pages and text.strip():
-            ocr_pages.add(number)
         parsed = _parse_invoice_text(path, text)
         invoice_number = parsed.get("invoice_number")
         if groups and invoice_number and invoice_number == groups[-1]["invoice_number"]:
@@ -388,10 +451,18 @@ def read_invoice_pdf_pages(path):
         pages = group["pages"]
         parsed["page_range"] = f"Page {pages[0]}" if len(pages)==1 else f"Pages {pages[0]}-{pages[-1]}"
         parsed["ocr_used"] = any(number in ocr_pages for number in pages)
+        needs_ocr = any(number - 1 in ocr_candidate_pages for number in pages)
         if parsed["ocr_used"]:
-            parsed["notes"] = "Local OCR suggestion - please check; " + parsed["notes"]
+            prefix = ("Scanned PDF; " if any(number - 1 in blank_pages for number in pages) else "")
+            parsed["notes"] = _invoice_notes(
+                parsed, group["text"], prefix=prefix + "Local OCR suggestion - please check",
+            )
             _warn_on_invoice_total_mismatch(parsed)
+        elif needs_ocr:
+            note = (f"Local OCR unavailable ({ocr_error})" if ocr_error
+                    else "Local OCR found no readable text")
+            parsed["notes"] = f'{parsed["notes"]}; {note}'.strip("; ")
         if not parsed.get("invoice_number"):
-            parsed["notes"] += "; confirm invoice boundaries and number" + ocr_error
+            parsed["notes"] += "; confirm invoice boundaries and number"
         results.append(parsed)
     return results

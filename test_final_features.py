@@ -544,7 +544,7 @@ class Stage3PaymentsPurchasesExpensesTest(unittest.TestCase):
         self.assertEqual((data["invoice_number"], data["invoice_date"], data["currency"], data["subtotal"], data["vat"], data["total"]), ("INV-2024-0457", "15-03-2024", "USD", 1000, 110, 1110))
         self.assertEqual(data["party_name"], "ALPHA TRADING SARL")
         blank = Path(self.folder.name) / "scan.pdf"; c = canvas.Canvas(str(blank)); c.rect(10, 10, 100, 100); c.save()
-        self.assertIn("scanned", read_invoice_pdf(blank)["notes"])
+        self.assertIn("scanned", read_invoice_pdf(blank)["notes"].casefold())
         wb = Workbook(); ws = wb.active; ws.append(["Date", "Description", "Currency", "Amount", "Without VAT", "VAT", "Reference"]); ws.append(["05-03-2025", "Rent", "USD", 500, 0, 55, "R-3"]); ws.append([None] * 7)
         wb.save(Path(self.folder.name) / "exp.xlsx")
         expenses = read_expenses(Path(self.folder.name) / "exp.xlsx")
