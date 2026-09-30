@@ -19,6 +19,21 @@ ARABIC_VAT = ("ضريبة القيمة المضافة", "الضريبة على �
               "قيمة الضريبة", "مبلغ الضريبة", "ض.ق.م")
 ARABIC_TOTAL = ("اجمالي الفاتورة", "المجموع الكلي", "المبلغ الاجمالي",
                 "المبلغ المستحق", "الصافي للدفع", "الاجمالي", "المجموع")
+ENGLISH_MONTHS = {
+    "jan": 1, "january": 1, "janv": 1, "janvier": 1,
+    "feb": 2, "february": 2, "fev": 2, "fevr": 2, "févr": 2, "février": 2,
+    "mar": 3, "march": 3, "mars": 3,
+    "apr": 4, "april": 4, "avr": 4, "avril": 4,
+    "may": 5, "mai": 5,
+    "jun": 6, "june": 6, "juin": 6,
+    "jul": 7, "july": 7, "juil": 7, "juillet": 7,
+    "aug": 8, "august": 8, "aout": 8, "août": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12, "déc": 12, "décembre": 12,
+}
+CURRENCY_CODE = re.compile(r"\b(USD|EUR|AED|LBP)\b", re.I)
 
 
 def _normalize_amount_line(line):
@@ -54,6 +69,9 @@ def _ocr_pdf_pages(path, page_numbers=None):
     config = "--psm 6"
     if tessdata.is_dir():
         config += f' --tessdata-dir "{tessdata}"'
+    english_config = "--psm 4"
+    if tessdata.is_dir():
+        english_config += f' --tessdata-dir "{tessdata}"'
     try:
         available = set(pytesseract.get_languages(config=config))
     except Exception as exc:
@@ -74,7 +92,31 @@ def _ocr_pdf_pages(path, page_numbers=None):
             try:
                 bitmap = page.render(scale=2.0)
                 image = bitmap.to_pil()
-                texts.append(pytesseract.image_to_string(image, lang=language, config=config))
+                text = pytesseract.image_to_string(image, lang=language, config=config)
+                # PSM 6 with both languages can mistake a clear English invoice
+                # heading for another word. If key invoice fields are missing,
+                # retry locally with English layout analysis and keep the better
+                # extraction; Arabic OCR remains the preferred result when it
+                # yields more usable fields.
+                parsed = _parse_invoice_text(path, text)
+                subtotal, vat, total = (
+                    parsed.get(key) for key in ("subtotal", "vat", "total")
+                )
+                amounts_conflict = (
+                    all(value is not None for value in (subtotal, vat, total))
+                    and abs(subtotal + vat - total) > max(0.05, abs(total) * 0.005)
+                )
+                core_fields_missing = any(
+                    parsed.get(key) in (None, "")
+                    for key in ("invoice_number", "invoice_date", "total")
+                )
+                if "eng" in languages and (core_fields_missing or amounts_conflict):
+                    alternate = pytesseract.image_to_string(
+                        image, lang="eng", config=english_config
+                    )
+                    if _ocr_invoice_score(path, alternate) > _ocr_invoice_score(path, text):
+                        text = alternate
+                texts.append(text)
             finally:
                 if image is not None:
                     image.close()
@@ -88,6 +130,25 @@ def _ocr_pdf_pages(path, page_numbers=None):
 
 def _ocr_pdf(path, page_numbers=None):
     return "\n".join(_ocr_pdf_pages(path, page_numbers))
+
+
+def _ocr_invoice_score(path, text):
+    parsed = _parse_invoice_text(path, text)
+    weights = {
+        "invoice_number": 2,
+        "invoice_date": 2,
+        "currency": 1,
+        "subtotal": 1,
+        "vat": 1,
+        "total": 2,
+    }
+    score = sum(weight for key, weight in weights.items()
+                if parsed.get(key) not in (None, ""))
+    subtotal, vat, total = (parsed.get(key) for key in ("subtotal", "vat", "total"))
+    if all(value is not None for value in (subtotal, vat, total)):
+        tolerance = max(0.05, abs(total) * 0.005)
+        score += 4 if abs(subtotal + vat - total) <= tolerance else -1
+    return score
 
 
 def _invoice_text_needs_ocr(path, text):
@@ -137,12 +198,35 @@ def _amount_after(text, keywords):
     return found
 
 
-def _vat_amount_after(text):
-    """Read a VAT amount without mistaking a percentage on the line for money."""
+def _vat_amount_after(text, invoice_currency=""):
+    """Read the VAT in the invoice currency, not its translated LBP equivalent."""
+    if invoice_currency:
+        inline = re.compile(
+            rf"{AMOUNT}\s*{re.escape(invoice_currency)}\s*VAT\b", re.I
+        )
+        for line in text.splitlines():
+            match = inline.search(line)
+            if match:
+                value = _number(match.group(1))
+                if value is not None:
+                    return value
+
     found = None
+    best_score = 0
     for raw in text.splitlines():
         line = _normalize_amount_line(raw)
-        if re.search(r"\b(?:vat|tva|tax)\s*(?:no\.?|number|registration|id)\b", line, re.I):
+        line = re.sub(r"(?i)\bv\s*\.?\s*a\s*\.?\s*t\s*\.?\b", "VAT", line)
+        if re.search(
+            r"\b(?:vat|tva|tax)\b.{0,35}\b(?:account|a/c|no\.?|number|registration|id)\b",
+            line, re.I,
+        ):
+            continue
+        if re.search(r"\b(?:vat|tva|tax)\s*#", line, re.I):
+            continue
+        if re.search(
+            r"\bpaid\s+on\s+behalf\b|\bbefore\s+vat\b|\btotal\s+(?:ht|excl|without)\s+vat\b",
+            line, re.I,
+        ):
             continue
         if re.search(r"رقم\s*(?:التسجيل\s*)?الضريبة", line):
             continue
@@ -151,18 +235,148 @@ def _vat_amount_after(text):
             if end is None:
                 continue
             suffix = line[end:]
-            values = [
-                _number(match.group())
-                for match in re.finditer(AMOUNT, suffix)
+            amount_matches = [
+                match for match in re.finditer(AMOUNT, suffix)
                 if not suffix[match.end():].lstrip().startswith(("%", "٪"))
             ]
+            values = [_number(match.group(1)) for match in amount_matches]
+            values = [(match, value) for match, value in zip(amount_matches, values)
+                      if value is not None]
             if values:
-                found = values[-1]
+                currencies = list(CURRENCY_CODE.finditer(suffix))
+                matching_currency = [
+                    match for match in currencies
+                    if match.group(1).upper() == invoice_currency.upper()
+                ] if invoice_currency else []
+                if matching_currency:
+                    currency_position = matching_currency[0].start()
+                    amount_match, value = min(
+                        values,
+                        key=lambda pair: abs(
+                            (pair[0].start() + pair[0].end()) / 2 - currency_position
+                        ),
+                    )
+                    score = 3
+                elif currencies:
+                    first_currency_position = currencies[0].start()
+                    before_currency = [
+                        (match, value) for match, value in values
+                        if match.end() <= first_currency_position
+                    ]
+                    if before_currency:
+                        amount_match, value = before_currency[-1]
+                        score = 2
+                    elif invoice_currency:
+                        # The only amount is explicitly labelled in another
+                        # currency, so don't treat an exchange conversion as VAT.
+                        continue
+                    else:
+                        amount_match, value = values[-1]
+                        score = 1
+                else:
+                    amount_match, value = values[-1]
+                    score = 1
+                if score >= best_score:
+                    found = value
+                    best_score = score
             elif not keyword.isascii():
                 prefix = line[:end - len(keyword)].strip()
                 if re.fullmatch(rf"{AMOUNT}\s*[:\-]?", prefix):
                     found = _number(re.search(AMOUNT, prefix).group())
     return found
+
+
+def _invoice_number(text):
+    pattern = re.compile(
+        r"(?:invoice|inv|facture|فاتورة|رقم\s*(?:ال)?فاتورة|n°\s*facture|bill)"
+        r"\s*(?:no\.?|number|num|#|n°|رقم)?\s*[:#.]?\s*([A-Z\d][A-Z\d\-/]{1,24})",
+        re.I,
+    )
+    for match in pattern.finditer(text):
+        candidate = _normalize_amount_line(match.group(1)).strip("-/")
+        if any(char.isdigit() for char in candidate):
+            return candidate
+
+    # Some invoice templates visually put the number before the "INVOICE NO"
+    # label; pypdf preserves that text order instead of the reading order.
+    for match in re.finditer(
+        r"(?<![A-Za-z])(?:invoice|inv|facture)\s*(?:no\.?|number|#)", text, re.I
+    ):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        prefix = text[line_start:match.start()]
+        leading_number = re.match(
+            r"\s*([A-Z\d][A-Z\d\-/]{1,24})\s+"
+            r"(?=(?:\d{1,2}\s+[A-Za-zÀ-ÿ]{3,10}[., ]+\d{4}|"
+            r"[A-Za-zÀ-ÿ]{3,10}\s+\d{1,2},?\s+\d{4})\b)",
+            prefix, re.I,
+        )
+        if leading_number and any(char.isdigit() for char in leading_number.group(1)):
+            return leading_number.group(1)
+    return ""
+
+
+def _invoice_date(text):
+    for pattern, order in DATE_PATTERNS:
+        for groups in re.findall(pattern, text):
+            try:
+                day, month, year = (
+                    groups if order == "dmy" else (groups[2], groups[1], groups[0])
+                )
+                return datetime(int(year), int(month), int(day)).strftime("%d-%m-%Y")
+            except ValueError:
+                continue
+
+    month_date = re.compile(
+        r"\b(?:(\d{1,2})[./\-\s]+([A-Za-zÀ-ÿ]{3,10})[.,/\-\s]+(\d{4})"
+        r"|([A-Za-zÀ-ÿ]{3,10})[.,]?\s+(\d{1,2}),?\s+(\d{4}))\b",
+        re.I,
+    )
+    for match in month_date.finditer(text):
+        if match.group(1):
+            day, month_name, year = match.group(1, 2, 3)
+        else:
+            month_name, day, year = match.group(4, 5, 6)
+        month = ENGLISH_MONTHS.get(month_name.casefold().rstrip("."))
+        if month is None:
+            continue
+        try:
+            return datetime(int(year), month, int(day)).strftime("%d-%m-%Y")
+        except ValueError:
+            continue
+    return ""
+
+
+def _invoice_currency(text):
+    codes = r"(USD|EUR|AED|LBP)"
+    lines = text.splitlines()
+    for line in lines:
+        match = re.search(rf"\b(?:the\s+)?sum\s+of\s+{codes}\b", line, re.I)
+        if match:
+            return match.group(1).upper()
+        match = re.search(rf"\btotal\s*\(\s*{codes}\s*\)", line, re.I)
+        if match:
+            return match.group(1).upper()
+
+    for index, line in enumerate(lines):
+        if not re.search(r"\b(?:grand\s+)?total\b|\bamount\s+due\b", line, re.I):
+            continue
+        if re.search(r"\bsub[\s-]*total\b|\btotal\s+(?:before|ht|excl|without)\b", line, re.I):
+            continue
+        segment = " ".join(lines[index:index + 3])
+        match = CURRENCY_CODE.search(segment)
+        if match:
+            return match.group(1).upper()
+
+    upper = text.upper()
+    for code, marks in (
+        ("LBP", ("LBP", "L.L", "ل.ل", "LL ")),
+        ("EUR", ("EUR", "€")),
+        ("AED", ("AED", "DHS")),
+        ("USD", ("USD", "US$")),
+    ):
+        if any(mark in upper for mark in marks):
+            return code
+    return ""
 
 
 def _invoice_total_after(text):
@@ -173,7 +387,11 @@ def _invoice_total_after(text):
         and not any(label in _normalize_amount_line(line) for label in ARABIC_SUBTOTAL)
         and not any(label in _normalize_amount_line(line) for label in ARABIC_VAT)
     ]
-    return _amount_after("\n".join(lines), ("grand total", "total amount", "amount due", "net to pay", "total ttc", "total", *ARABIC_TOTAL))
+    return _amount_after(
+        "\n".join(lines),
+        ("grand total", "total amount", "amount due", "net to pay", "total ttc",
+         "sum of", "total", *ARABIC_TOTAL),
+    )
 
 
 def _line_items(text):
@@ -316,25 +534,11 @@ def _parse_invoice_text(path, text):
     result["suggested_type"] = suggest_invoice_type(text)
     if len(text.strip()) < 20:
         result["notes"] = "This PDF is a scanned image (no text inside). The file will be attached; enter the amounts manually."; return result
-    match = re.search(
-        r"(?:invoice|inv|facture|فاتورة|رقم\s*(?:ال)?فاتورة|n°\s*facture|bill)"
-        r"\s*(?:no\.?|number|num|#|n°|رقم)?\s*[:#.]?\s*([A-Z\d][A-Z\d\-/]{1,24})",
-        text, re.I,
-    )
-    if match and any(ch.isdigit() for ch in match.group(1)):
-        result["invoice_number"] = _normalize_amount_line(match.group(1)).strip("-/")
-    for pattern, order in DATE_PATTERNS:
-        for groups in re.findall(pattern, text):
-            try:
-                day, month, year = (groups if order == "dmy" else (groups[2], groups[1], groups[0]))
-                result["invoice_date"] = datetime(int(year), int(month), int(day)).strftime("%d-%m-%Y"); break
-            except ValueError: continue
-        if result["invoice_date"]: break
-    upper = text.upper()
-    for code, marks in (("LBP", ("LBP", "L.L", "ل.ل", "LL ")), ("EUR", ("EUR", "€")), ("AED", ("AED", "DHS")), ("USD", ("USD", "US$"))):
-        if any(mark in upper for mark in marks): result["currency"] = code; break
+    result["invoice_number"] = _invoice_number(text)
+    result["invoice_date"] = _invoice_date(text)
+    result["currency"] = _invoice_currency(text)
     result["total"] = _invoice_total_after(text)
-    result["vat"] = _vat_amount_after(text)
+    result["vat"] = _vat_amount_after(text, result["currency"])
     result["subtotal"] = _amount_after(text, ("subtotal", "sub-total", "sub total", "before vat", "total ht", "net amount", "excl", *ARABIC_SUBTOTAL))
     for line in text.splitlines():
         clean = line.strip()

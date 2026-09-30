@@ -1,5 +1,13 @@
 # Saber Accounting MVP
 
+## Version 2.9.27 (PDF invoice import corrections; 30 September 2026)
+
+- Improved invoice-number and English month-name date extraction, invoice-currency selection, and total/VAT parsing for scanned and text-based PDFs.
+- Retained combined English/Arabic OCR as the primary pass. A local English layout retry is used when key fields are missing or the extracted amounts do not reconcile. VAT registration numbers, “paid on behalf” charges, and LBP conversion amounts are not mistaken for invoice VAT.
+- The supplied one-page scan now extracts its invoice number, date, currency, subtotal, VAT, and total. The 38-page mixed bundle keeps adjacent invoices separate and yields 20 review rows; unclear/supporting pages remain marked for manual review.
+- Validation: all 329 automated tests passed.
+- Changed files: `pdf_import.py`, `test_pdf_ocr.py`, `installer.iss`, `desktop.py`, and this README.
+
 ## VAT exchange rates and payable rounding review (29 September 2026)
 
 - The quarterly schedule converts each foreign-currency document at the saved accounting rate for its document date, rounds each converted VAT amount to whole LBP, and applies a legacy ceiling to the positive balance after credits: to LBP 10,000 for quarters ending on/after 25 November 2024. These are **worksheet estimates**, not verified rules for every VAT transaction or the official payable box. Exports now explicitly flag that limitation.

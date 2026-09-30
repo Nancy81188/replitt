@@ -59,7 +59,8 @@ class OcrPageTests(unittest.TestCase):
                 self.closed = True
 
         document = FakeDocument()
-        image_to_string = Mock(return_value="فاتورة Invoice No 25")
+        alternate_text = "Invoice No: 25\nDate: 15/03/2026\nTotal USD 100.00"
+        image_to_string = Mock(side_effect=["فاتورة Invoice No 25", alternate_text])
         pytess = types.SimpleNamespace(tesseract_cmd="")
         pypdfium = types.ModuleType("pypdfium2")
         pypdfium.PdfDocument = Mock(return_value=document)
@@ -71,10 +72,14 @@ class OcrPageTests(unittest.TestCase):
         with patch.dict(sys.modules, {"pypdfium2": pypdfium, "pytesseract": pytesseract}):
             result = _ocr_pdf_pages("scanned.pdf", [1])
 
-        self.assertEqual(result, ["فاتورة Invoice No 25"])
+        self.assertEqual(result, [alternate_text])
         self.assertEqual(document.pages[0].render_calls, [])
         self.assertEqual(document.pages[1].render_calls, [{"scale": 2.0}])
-        self.assertEqual(image_to_string.call_args.kwargs["lang"], "eng+ara")
+        self.assertEqual(image_to_string.call_args_list[0].kwargs["lang"], "eng+ara")
+        self.assertEqual(image_to_string.call_args_list[0].kwargs["config"], "--psm 6")
+        self.assertEqual(image_to_string.call_args_list[1].kwargs["lang"], "eng")
+        self.assertEqual(image_to_string.call_args_list[1].kwargs["config"], "--psm 4")
+        self.assertEqual(image_to_string.call_count, 2)
         self.assertTrue(document.pages[1].bitmap.image.closed)
         self.assertTrue(document.closed)
 
@@ -146,6 +151,45 @@ class OcrPageTests(unittest.TestCase):
             with self.subTest(header=header):
                 text = f"{header}\nDate: 15/03/2026\nSupplier Co\nTotal: 100"
                 self.assertEqual(_parse_invoice_text("invoice.pdf", text)["invoice_number"], expected)
+
+    def test_invoice_number_before_label_in_reordered_pdf_text(self):
+        text = "734 Jul 8, 2026 Jul 8, 2026INVOICE NO.: ISSUE DATE: DUE DATE:"
+
+        self.assertEqual(
+            _parse_invoice_text("reordered-header.pdf", text)["invoice_number"], "734"
+        )
+
+    def test_bcc_invoice_fields_with_month_date_and_lbp_vat_conversion(self):
+        text = (
+            "Invoice will be considered approved after review.\n"
+            "Invoice: BC-2026-17\nDate: 12 Mar 2026\n"
+            "Sub Total: 200.00\n"
+            "VAT: 10.00 LBP: 900,000.00\n"
+            "The Sum of USD Two Hundred Ten USD And Zero /100 USD 210.00"
+        )
+
+        parsed = _parse_invoice_text("bcc-invoice.pdf", text)
+
+        self.assertEqual(parsed["invoice_number"], "BC-2026-17")
+        self.assertEqual(parsed["invoice_date"], "12-03-2026")
+        self.assertEqual(parsed["currency"], "USD")
+        self.assertEqual((parsed["subtotal"], parsed["vat"], parsed["total"]),
+                         (200.0, 10.0, 210.0))
+
+    def test_invoice_currency_and_vat_ignore_lbp_translation_line(self):
+        text = (
+            "Invoice No: INV-43\nDate: 22 Jan 2026\n"
+            "Total Before VAT USD 1,000.00\n"
+            "110.00USDVAT 11%VAT LBP: 9,900,000\n"
+            "Total USD 1,110.00"
+        )
+
+        parsed = _parse_invoice_text("mixed-currency.pdf", text)
+
+        self.assertEqual(parsed["invoice_date"], "22-01-2026")
+        self.assertEqual(parsed["currency"], "USD")
+        self.assertEqual((parsed["subtotal"], parsed["vat"], parsed["total"]),
+                         (1000.0, 110.0, 1110.0))
 
     def test_arabic_amount_label_variants_and_rtl_number_first_rows(self):
         text = ("فاتورة رقم 45\nالتاريخ 15/03/2026\n"

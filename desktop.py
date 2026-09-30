@@ -106,7 +106,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
     def __init__(self):
         _enable_windows_dpi_awareness()
         super().__init__()
-        self.title("Saber Accounting 2.9.26")
+        self.title("Saber Accounting 2.9.27")
         screen_width, screen_height = self.winfo_screenwidth(), self.winfo_screenheight()
         try: dpi_scale=max(1.0,min(2.0,self.winfo_fpixels("1i")/96.0))
         except tk.TclError: dpi_scale=1.0
