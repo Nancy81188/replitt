@@ -9,7 +9,6 @@ import mimetypes
 import time
 import json
 import uuid
-from urllib.request import urlopen
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -19,6 +18,7 @@ from client import ApiClient
 from i18n import tr
 from report_export import export_excel, export_invoice_pdf, export_pdf, print_rows
 from desktop_final import FinalFeaturesMixin
+from cnss_forms_ui import CNSSFormsMixin
 from desktop_brains import BrainsScreensMixin
 from desktop_dimensions import DimensionsMixin
 from desktop_stage3 import Stage3Mixin
@@ -102,7 +102,7 @@ def _enable_windows_dpi_awareness():
     try: ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except (AttributeError,OSError): pass
 
-class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScreensMixin, FinalFeaturesMixin, tk.Tk):
+class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScreensMixin, FinalFeaturesMixin, CNSSFormsMixin, tk.Tk):
     def __init__(self):
         _enable_windows_dpi_awareness()
         super().__init__()
@@ -2139,24 +2139,14 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
 
     def build_payroll(self):
         nested=ttk.Notebook(self.payroll_tab); nested.pack(fill="both",expand=True,padx=8,pady=8); self.payroll_notebook=nested
-        employees=tk.Frame(nested,bg=LIGHT); run=tk.Frame(nested,bg=LIGHT); settings_outer,settings_page=self.scrollable_page(nested); reports_page=tk.Frame(nested,bg=LIGHT)
+        employees=tk.Frame(nested,bg=LIGHT); run=tk.Frame(nested,bg=LIGHT); settings_outer,settings_page=self.scrollable_page(nested); reports_page=tk.Frame(nested,bg=LIGHT); forms_page=tk.Frame(nested,bg=LIGHT)
         self.payroll_employees_page=employees
-        nested.add(employees,text="Employees"); nested.add(run,text="Payroll Entry"); nested.add(reports_page,text="Payroll Reports & Worksheets (R5 / R6 / R10)"); nested.add(settings_outer,text="Tax & NSSF Settings")
+        self.cnss_forms_page=forms_page
+        nested.add(employees,text="Employees"); nested.add(run,text="Payroll Entry"); nested.add(reports_page,text="Payroll Reports & Worksheets (R5 / R6 / R10)"); nested.add(forms_page,text="CNSS Forms"); nested.add(settings_outer,text="Tax & NSSF Settings")
         employee_actions=tk.Frame(employees,bg=LIGHT); employee_actions.pack(fill="x",padx=10,pady=8)
         self.action_button(employee_actions,"New Employee",lambda:self.employee_dialog()).pack(side="left",padx=4)
         self.action_button(employee_actions,"Edit Selected",self.edit_selected_employee).pack(side="left",padx=4)
-        self.action_button(employee_actions,"R3 Registration Worksheet",lambda:self.employee_r3_worksheet("preview")).pack(side="left",padx=4)
-        self.action_button(employee_actions,"R3 PDF",lambda:self.employee_r3_worksheet("pdf")).pack(side="left",padx=4)
-        self.action_button(employee_actions,"R3 Excel",lambda:self.employee_r3_worksheet("xlsx")).pack(side="left",padx=4)
-        self.action_button(employee_actions,"Official R3 Form",lambda:self.download_payroll_form("R3")).pack(side="left",padx=4)
-        self.action_button(employee_actions,"Official R3-1 Form",lambda:self.download_payroll_form("R3-1")).pack(side="left",padx=4)
-        nssf_forms=tk.Frame(employees,bg=LIGHT); nssf_forms.pack(fill="x",padx=10,pady=(0,5))
-        tk.Label(nssf_forms,text="NSSF employee forms:",bg=LIGHT,fg=NAVY,font=("Segoe UI",9,"bold")).pack(side="left",padx=4)
-        self.action_button(nssf_forms,"Employment Declaration Worksheet",lambda:self.employee_nssf_declaration("hire","preview")).pack(side="left",padx=4)
-        self.action_button(nssf_forms,"Termination Declaration Worksheet",lambda:self.employee_nssf_declaration("leave","preview")).pack(side="left",padx=4)
-        self.action_button(nssf_forms,"New Employee Registration",lambda:self.download_payroll_form("NSSF-HIRE-NEW")).pack(side="left",padx=4)
-        self.action_button(nssf_forms,"Hire Existing NSSF Member",lambda:self.download_payroll_form("NSSF-HIRE-EXISTING")).pack(side="left",padx=4)
-        self.action_button(nssf_forms,"Employee Leaving",lambda:self.download_payroll_form("NSSF-LEAVE")).pack(side="left",padx=4)
+        self.action_button(employee_actions,"CNSS Employee Forms",lambda:self.open_cnss_form("cnss_r3", self._selected_employee_id())).pack(side="left",padx=4)
         self.action_button(employee_actions,"Refresh",self.load_payroll).pack(side="left",padx=4)
         self.employee_tree=self.table(employees,[("number","Employee ID",105),("name","Employee Name",220),("job","Job Title",150),
             ("start","Starting Date",110),("leaving","Leaving Date",110),("branch","Branch",120),("currency","Currency",70),
@@ -2245,6 +2235,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
             self.account_search_box(mapping_frame,self.payroll_employee_accounts[key],16).grid(row=index,column=1,padx=5,pady=2)
             self.account_search_box(mapping_frame,self.payroll_manager_accounts[key],16).grid(row=index,column=2,padx=5,pady=2)
         self.build_payroll_reports_page(reports_page)
+        self.build_cnss_forms_page(forms_page)
         self.load_payroll()
         self.load_payroll_settings()
 
@@ -2339,37 +2330,14 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
             f'NSSF_{kind}_Worksheet_{employee["employee_number"]}',format_name)
 
     def download_payroll_form(self,form):
-        official={"R3":"https://eservices.finance.gov.lb/Resources/Namazej/DASS1/%D8%B13.pdf",
-                  "R3-1":"https://www.finance.gov.lb/en-us/Taxation/Na/DASS1/%D8%B13-1.pdf",
-                  "NSSF-DUE":"https://drive.google.com/uc?export=download&id=1ZwZR6kFj19KPbtALttm8U6Ji3ICJUjGB",
-                  "NSSF-SETTLEMENT":"https://drive.google.com/uc?export=download&id=14eHUtHDblW9mE_4Vs82PmRrmbMGGSEKg",
-                  "NSSF-ANNUAL":"https://drive.google.com/uc?export=download&id=1TNwLlioahMJLaiX3ma6PPYqrgbHm07f_",
-                  "NSSF-HIRE-NEW":"https://drive.google.com/uc?export=download&id=1FHWgIuJm38oLcypxT6lMXlTlY9eCXDpe",
-                  "NSSF-HIRE-EXISTING":"https://drive.google.com/uc?export=download&id=1jK1Nv4RgzslncCsV-5gc7e2rHYZQThyq",
-                  "NSSF-LEAVE":"https://drive.google.com/uc?export=download&id=1_stgCRJwJjdqr2kFLy07ZCwiXDkMdZIy"}
-        if form not in official: raise ValueError("Unknown payroll form")
-        agency="CNSS" if form.startswith("NSSF") else "MOF"
-        import tempfile
-        from pdf_form_editor import open_pdf_form_editor
-        temporary=tempfile.TemporaryDirectory(prefix="saber-official-form-")
-        target=Path(temporary.name)/f"Lebanon_{agency}_{form}.pdf"
-        try:
-            with urlopen(official[form],timeout=20) as response: content=response.read()
-            if not content.startswith(b"%PDF"): raise ValueError(f"The {agency} form link did not return a PDF")
-            target.write_bytes(content)
-            editor=open_pdf_form_editor(self,target)
-            editor._owned_tempdir=temporary
-        except Exception as exc:
-            temporary.cleanup()
-            return messagebox.showerror(f"Official {form}",f"Could not open the form: {exc}")
-        if form in ("NSSF-DUE","NSSF-SETTLEMENT","NSSF-ANNUAL"):
-            messagebox.showwarning(f"Official {form}",
-                "Check the form's preprinted rates against the applicable NSSF period before filling or printing.")
+        selected=self.employee_tree.selection() if hasattr(self,"employee_tree") else ()
+        self.open_cnss_form(form,selected[0] if selected else None)
 
     def load_payroll(self):
         if not hasattr(self,"employee_tree"): return
         try: self.employee_rows=self.client.employees(); payroll=self.client.payroll()
         except Exception as exc: return messagebox.showerror("Payroll",str(exc))
+        if hasattr(self,"cnss_employee_combo"): self.refresh_cnss_employee_options()
         self.employee_tree.delete(*self.employee_tree.get_children())
         for row in self.employee_rows: self.employee_tree.insert("","end",iid=str(row["id"]),values=(row["employee_number"],row["full_name"],row["job_title"],safe_display_date(row.get("hire_date")),safe_display_date(row.get("leave_date")),row.get("branch_name") or "",row["currency"],row["base_salary"],row["nssf_number"],"Yes" if row["active"] else "No"))
         self.payroll_employee_map={f'{row["employee_number"]} - {row["full_name"]}':row for row in self.employee_rows if row["active"]}
