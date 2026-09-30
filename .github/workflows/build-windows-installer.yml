@@ -29,60 +29,25 @@ jobs:
       - name: Install build requirements
         run: python -m pip install -r requirements.txt
 
-      - name: Prepare bundled offline OCR (English and Arabic)
-        shell: pwsh
-        run: |
-          choco install tesseract --yes --no-progress --version=5.5.0.20241111
-          $engine = "Assets\ocr\engine"
-          $tessdata = "Assets\ocr\tessdata"
-          New-Item -ItemType Directory -Force -Path $engine, $tessdata | Out-Null
-          $tesseract = (Get-Command tesseract.exe -ErrorAction Stop).Source
-          $tesseractRoot = Split-Path -Parent $tesseract
-          Copy-Item $tesseract $engine
-          Copy-Item (Join-Path $tesseractRoot "*.dll") $engine
-          Copy-Item (Join-Path $tesseractRoot "tessdata\eng.traineddata") $tessdata
-          Invoke-WebRequest `
-            -Uri "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/ara.traineddata" `
-            -OutFile (Join-Path $tessdata "ara.traineddata")
-          if (-not (Test-Path (Join-Path $tessdata "ara.traineddata"))) {
-            throw "Arabic Tesseract language data was not downloaded."
-          }
-
       - name: Run all tests
         run: python -m unittest discover -v -p "test_*.py"
 
       - name: Build standalone application (data service included)
         run: |
             pyinstaller --noconfirm --clean --onedir --windowed --noupx `
-            --add-data "Assets/Saber_for_Audit_logo.png;assets" --add-data "Assets/fonts;assets/fonts" --add-data "Assets/ocr;ocr" `
+            --add-data "Assets/Saber_for_Audit_logo.png;assets" --add-data "Assets/fonts;assets/fonts" `
             --hidden-import arabic_reshaper --hidden-import bidi --hidden-import bidi.algorithm --collect-data arabic_reshaper `
-            --hidden-import payroll_reports --hidden-import vat_return --hidden-import desktop_final --hidden-import desktop_brains --hidden-import ledger_reports --hidden-import desktop_dimensions --hidden-import desktop_stage3 --hidden-import ai_mapper --hidden-import ai_service --hidden-import pdf_import --hidden-import pypdf --hidden-import pypdfium2 --hidden-import pytesseract --collect-all pypdfium2 --collect-all pypdfium2_raw --hidden-import year_end --hidden-import lebanese_payroll --hidden-import inventory --hidden-import fixed_assets --hidden-import desktop_inventory --hidden-import desktop_v22 --hidden-import chart_extra --hidden-import invoice_calc --hidden-import tafqeet --hidden-import business_reports --hidden-import financial_projection --hidden-import financial_statements `
+            --hidden-import payroll_reports --hidden-import vat_return --hidden-import desktop_final --hidden-import desktop_brains --hidden-import ledger_reports --hidden-import desktop_dimensions --hidden-import desktop_stage3 --hidden-import ai_mapper --hidden-import ai_service --hidden-import pdf_import --hidden-import pypdf --hidden-import year_end --hidden-import lebanese_payroll --hidden-import inventory --hidden-import fixed_assets --hidden-import desktop_inventory --hidden-import desktop_v22 --hidden-import chart_extra --hidden-import invoice_calc --hidden-import tafqeet --hidden-import business_reports --hidden-import financial_projection --hidden-import financial_statements `
             --name SaberAccounting run_desktop.py
 
-      - name: Verify application and offline PDF reading files
+      - name: Verify the application was built
         shell: pwsh
         run: |
           if (-not (Test-Path "dist\SaberAccounting\SaberAccounting.exe")) {
-            throw "PyInstaller did not produce dist\SaberAccounting\SaberAccounting.exe - check the build step above."
+            Write-Error "PyInstaller did not produce dist\SaberAccounting\SaberAccounting.exe - check the build step above."
+            exit 1
           }
-          $bundle = "dist\SaberAccounting\_internal"
-          # Check the exact paths used by the frozen app and pypdfium2_raw.
-          foreach ($relativePath in @(
-            "ocr\engine\tesseract.exe",
-            "ocr\tessdata\eng.traineddata",
-            "ocr\tessdata\ara.traineddata",
-            "pypdfium2_raw\pdfium.dll",
-            "pypdfium2_raw\version.json"
-          )) {
-            $path = Join-Path $bundle $relativePath
-            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-              throw "Missing packaged OCR/PDFium file: $path. Check PyInstaller --add-data and --collect-all settings."
-            }
-            if ((Get-Item -LiteralPath $path).Length -eq 0) {
-              throw "Empty packaged OCR/PDFium file: $path. Check the staged files and PyInstaller build."
-            }
-            Write-Host "OK: $path"
-          }
+          Write-Host "OK: dist\SaberAccounting\SaberAccounting.exe was produced."
 
       # Must succeed: the installer's "daily backups" option runs this program.
       - name: Build background backup service
