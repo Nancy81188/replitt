@@ -172,6 +172,20 @@ class ProgramWindowFixesTest(unittest.TestCase):
             self.app.open_item_cost_link()
         self.assertTrue(opened.called)
 
+    def test_unused_pages_stay_unbuilt_after_startup_events(self):
+        self.app.build_pending_pages()
+        self.app.main_screen()
+        pending = list(self.app.__dict__["_pending_builders"])
+        # Run the event loop past the old background-build timer and alert callback.
+        self.app.after(900, self.app.quit)
+        self.app.mainloop()
+        self.assertEqual(self.app.__dict__["_pending_builders"], pending)
+        page = self.app.main_tab_pages[self.app.tab_names.index("Sales Invoice")]
+        self.app.select_main_tab(page)
+        self.assertIn("sales_party_box", self.app.__dict__)
+        self.assertTrue(callable(self.app.sales_party_box._f2))
+        self.assertTrue(self.app.__dict__["_pending_builders"])
+
     def test_program_opens_on_the_dashboard_first_and_builds_the_rest(self):
         self.app.build_pending_pages(); self.app.update()  # as on a slower PC: the previous screen is complete
         self.app.main_screen()
