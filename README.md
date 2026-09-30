@@ -1,52 +1,5 @@
 # Saber Accounting MVP
 
-## Version 2.9.27 (PDF invoice import corrections; 30 September 2026)
-
-- Improved invoice-number and English month-name date extraction, invoice-currency selection, and total/VAT parsing for scanned and text-based PDFs.
-- Retained combined English/Arabic OCR as the primary pass. A local English layout retry is used when key fields are missing or the extracted amounts do not reconcile. VAT registration numbers, “paid on behalf” charges, and LBP conversion amounts are not mistaken for invoice VAT.
-- The supplied one-page scan now extracts its invoice number, date, currency, subtotal, VAT, and total. The 38-page mixed bundle keeps adjacent invoices separate and yields 20 review rows; unclear/supporting pages remain marked for manual review.
-- Validation: all 329 automated tests passed.
-- Changed files: `pdf_import.py`, `test_pdf_ocr.py`, `installer.iss`, `desktop.py`, and this README.
-
-## VAT exchange rates and payable rounding review (29 September 2026)
-
-- The quarterly schedule converts each foreign-currency document at the saved accounting rate for its document date, rounds each converted VAT amount to whole LBP, and applies a legacy ceiling to the positive balance after credits: to LBP 10,000 for quarters ending on/after 25 November 2024. These are **worksheet estimates**, not verified rules for every VAT transaction or the official payable box. Exports now explicitly flag that limitation.
-- [MoF Decree 11230 of 9 May 2023](https://www.finance.gov.lb/en-us/Taxation/LRT/VAT/Documents/11230.pdf), amending Article 18 of Decree 7308, is **not** a blanket document-date accounting-rate rule: it distinguishes imports at the jointly set customs rate, foreign-currency supplies to professional (non-consumer) customers at the then-Sayrafa rate, telecommunications invoices and airport/port fees; where VAT actually collected exceeds the amount under those rules, the collected amount is declarable. The decree also conditions input deduction/refund on further rules. It says these arrangements apply pending a unified exchange rate. The Ministry's [VAT legislation index](https://www.finance.gov.lb/ar-lb/Taxation/LRT/VAT) lists this decree, but does not establish that the former Sayrafa rate is usable in 2026. Confirm the rate and tax-point date for each kind of supply/import and any later changes with the VAT Directorate before filing; the software does not automatically classify counterparties or select the statutory rates.
-- The previously cited “MoF decision 1195” and effective date 25 November 2024 could **not** be confirmed in the Ministry's VAT legislation index as authority to round VAT payable upward to LBP 10,000. Do not rely on that ceiling as an official filing or payment rule without the current Directorate instructions. No automatic calculation was changed without verified replacement instructions; tests pin the existing dates, currency conversions, credit order and rounding boundaries so a later confirmed rule can be changed safely.
-
-## Version 2.9.26 (Security protections, asset rollforward, and OCR review checks)
-
-- Restricted company database paths to the app's data area, limited API request size, and kept raw database backup access unavailable to viewer accounts. Accountant backup export remains available.
-- Added an annual fixed-asset rollforward by currency with opening cost, additions, posted depreciation, closing values, and unposted scheduled depreciation. Preview and export to Excel or PDF are available from Fixed Assets.
-- OCR-extracted invoice amounts remain review-only. The app now warns when OCR-read subtotal, VAT, and total do not reconcile; an image-only PDF using a clearly labeled VAT amount was also checked through the full reader.
-- Added Windows DPI awareness and display-scaled startup sizing. Verification on physical 125% and 150% Windows displays remains pending.
-- Validation: 192 automated tests passed. The Windows installer workflow is configured to bundle English/Arabic Tesseract data; running that installer build remains pending.
-- Changed files: `company_manager.py`, `server.py`, `client.py`, `desktop.py`, `desktop_stage3.py`, `fixed_assets.py`, `pdf_import.py`, their focused tests, `installer.iss`, and this README.
-
-## VAT worksheet verification (29 September 2026)
-
-- The Filing Worksheet now groups taxpayer/period details, revenue/output VAT, purchases/input VAT, partial-deduction review, and balance/credit in the broad order of the Ministry's published Q1-2 and Q11-2 specimens. This is a **specimen-inspired preparation layout**, not the forms themselves. The public specimens are marked 2010; the partial-deduction review does not reproduce Q11-2's purchase/expense/asset-use boxes. No A-F worksheet reference has been mapped to a current issued form box, and the worksheet cannot be submitted as a declaration. Obtain the current issued forms from the VAT Directorate and reconcile the required schedules manually.
-- The Ministry of Finance (MoF) Forms page lists the periodic declaration (form Q1-2) and the partial-deduction supplement (Q11-2). It says the adopted forms are effective from 1 January 2012, and that downloadable copies must not be used for filing: filers must obtain the issued forms from the VAT Directorate. The public Q1-2 specimen is marked 2010. Neither source certifies the worksheet's A-F references as current Ministry box numbers, so they remain internal references; the worksheet is not a populated official form or an electronic filing.
-- The MoF's VAT guidance supports the calculation structure: output VAT less deductible input VAT; excess deductible VAT carries to later periods or may be refunded under the applicable rules; partial deduction is based on turnover that grants deduction rights divided by all turnover. The guidance describes semiannual refunds after Q2 or annual refunds after year-end; quarterly requests require qualifying exporter status and are limited by the export proportion. The app does not store enough information to validate refund eligibility and now flags every refund request for manual review. The worksheet's mixed-use adjustment follows the pro-rata principle. These are conceptual cross-checks, not confirmation that its row layout matches the issued declaration.
-- The Ministry's 2026 Citizen Budget says the periodic VAT declaration deadline is one month instead of 20 days (Article 51); the VAT website's older Payable VAT page still says 20 days. The software's 2026 due-date calculation follows the 2026 budget change.
-- Source pages checked: [MoF VAT forms](https://www.finance.gov.lb/en-us/Taxation/Companies/VAT/Pages/Forms.aspx), [MoF declaration guidance](https://www.finance.gov.lb/en-us/Taxation/Companies/VAT/Pages/Declaration.aspx), [MoF deduction/refund guidance](https://www.finance.gov.lb/en-us/Taxation/Companies/VAT/Pages/Refunding-VAT.aspx), [MoF payable VAT page](https://www.finance.gov.lb/en-us/Taxation/Companies/VAT/Pages/Payable-VAT.aspx), and [MoF Citizen Budget 2026](https://www.finance.gov.lb/en-us/Finance/BI/ABDP/Annual%20Budget%20Documents%20and%20Process/Citizen%20Budget%202026-Apr26-En-final.pdf).
-- Rate-source warning: the MoF Tax Rate page still says 10%, while the [Lebanese University Legal Information Center's amendment to Article 25 of VAT Law 379](http://77.42.251.205/PrintArticle.aspx?LawArticleID=0&LawID=273985&Law_Tree_Section_ID=286534) states 11%. The worksheet uses the 11% rate, but the stale MoF rate page is not treated as confirmation of the current rate. Check the applicable law and any later amendment before filing.
-
-## Version 2.9.25 (Offline purchase PDF OCR and complete review)
-
-- Scanned purchase PDFs now use local English/Arabic Tesseract OCR when available. OCR suggestions are still review-only; no invoice is posted automatically and the document is not sent to an external service. The Windows installer build bundles the OCR engine and language data.
-- Text-based PDF extraction remains the first choice. If OCR components are missing or a scan is unreadable, the purchase can still be attached and entered manually. The optional AI reader remains separate and consent-based.
-- Includes the quarterly VAT filing worksheet, purchase line-item suggestions and VAT fixes described in 2.9.24, plus the existing payroll/NSSF reporting and responsive navigation.
-- Changed files: `pdf_import.py`, `requirements.txt`, `.github/workflows/build-windows-installer.yml`, `desktop.py`, `installer.iss`, `test_pdf_ocr.py`, and this README.
-
-## Version 2.9.24 (Quarterly VAT filing worksheet and purchase PDF review)
-
-- Quarterly VAT now has a separate **Filing Worksheet** preview and PDF/Excel export. It fills the employer details, selected quarter, taxable bases, output VAT, input VAT, partial deduction, credit brought forward, payable and credit carried forward from posted records. The existing Supporting Documents and Manual Adjustments remain available for reconciliation. A filtered or Review-inclusive report cannot be exported as a filing worksheet.
-- The A-F references are internal worksheet references, **not certified Ministry of Finance box numbers**. This is a preparation worksheet, not a populated official government PDF or electronic filing; compare it with the current official declaration and confirm employer details, period, deduction ratio, exchange rates and excluded documents before submission.
-- Purchase PDF reading suggests common item rows in the reviewable purchase screen; unmatched items are found or created on Save and stock receipts remain linked to the invoice. The optional AI reader can suggest items from scanned PDFs after the user approves sending the first page to OpenAI. PDF values and item rows require review before posting; the basic text parser alone does not OCR scanned PDFs.
-- Exempt-use purchase input VAT now remains visible on the original supplier invoice and quarterly return, while a separate balanced journal entry transfers it from input VAT to non-deductible cost. Mixed-use VAT continues to use the existing VAT return's provisional/final deduction ratio; do not apply a second item-level ratio to the same tax.
-- Changed files: `vat_return.py`, `desktop_final.py`, `desktop_stage3.py`, `database.py`, `pdf_import.py`, `ai_service.py`, `test_vat_filing_worksheet.py`, `desktop.py`, `installer.iss`, and this README.
-
 ## Version 2.9.23 (Payroll: family allocation shown at once and editable)
 
 - Payroll > Payroll Entry: the **Family Allocation** field now shows the automatic amount as soon as the employee (or the period date) is chosen, and after Calculate: spouse and children allowances of the period (Tax & NSSF Settings), within the maximum. Type in the field to use another amount for this payroll; Calculate and Save then use your amount (with a compliance note). Choosing another employee shows the automatic amount again.
@@ -201,7 +154,7 @@
 - Employees > R3 Registration Worksheet can preview, export PDF or export Excel with the saved employee details and highlights missing information. This worksheet helps prepare the Ministry of Finance's R3 new-employee registration; it is not the official form or an electronic submission. Complete the official form and its supporting documents separately.
 - Employees has download buttons for the original Ministry of Finance R3 and R3-1 PDF forms. The original blank forms are downloaded from the Ministry website when requested.
 - NSSF contributions report lists the employees in the selected period, counts both registered employees and employees with payroll, and shows missing NSSF numbers. The report's Employee List / Edit button opens the editable employee list.
-- Payroll > Payroll Reports & Worksheets > SETTLEMENT builds an annual NSSF reconciliation from posted payroll. Use Filed NSSF Wages to enter the wages already declared for each month and actual payments; unknown values stay blank and the settlement remains incomplete. The difference uses the effective rates saved for each month. The entries have an audit log and do not post a journal voucher automatically.
+- Payroll > Official Reports > SETTLEMENT builds an annual NSSF reconciliation from posted payroll. Use Filed NSSF Wages to enter the wages already declared for each month and actual payments; unknown values stay blank and the settlement remains incomplete. The difference uses the effective rates saved for each month. The entries have an audit log and do not post a journal voucher automatically.
 - The original blank CNSS contributions, annual settlement and annual employee declaration PDFs can be downloaded from the CNSS links. Those public templates show a preprinted 9% sickness rate; compare the template with the period's saved rates before submission. The application's reconciliation is a review worksheet, not an official CNSS filing.
 - The Employee File dialog scrolls on smaller screens, with Save always visible.
 - Main navigation grows to fit both rows of tabs; outer page scrollbars appear only when the content exceeds the available space.
@@ -311,17 +264,20 @@ The first worksheet is imported. Recognized English, Arabic, and French headings
 - Existing VAT values are preserved, even when they differ from 11%.
 - Source totals that do not equal subtotal plus VAT are preserved, marked `review`, and posted against Import Variance so the ledger remains balanced.
 
-## Build the Windows installer
+## Build the Windows executable
 
-Use the included Windows build workflow for a release. It runs the tests, bundles
-the desktop app with its local data service and offline OCR files, checks required
-PDF/OCR assets, and creates `SaberAccountingSetup.exe`. A bare PyInstaller command
-does **not** produce the same complete installer. The Windows installer cannot be
-built or verified on a Linux runner.
+On Windows, after installing the requirements:
+
+```bat
+pyinstaller --noconfirm --onefile --windowed --name SaberAccounting run_desktop.py
+pyinstaller --noconfirm --onefile --name SaberAccountingServer run_server.py
+```
+
+The executables will be created in the `dist` folder. No GitHub account is required.
 
 ## Build a one-click installer online
 
-Upload the **contents of this folder** to the root of a private GitHub repository (so `.github/workflows/build-windows-installer.yml` is at the repository root). The included workflow runs the tests, creates the standalone app with its local data service, and packages it as `SaberAccountingSetup.exe`. Open the repository's Actions tab, select **Build Saber Accounting Installer**, run the workflow, and download the **SaberAccountingSetup** artifact. End users do not need Python or GitHub.
+Upload this project to a private GitHub repository. The included workflow runs the tests, creates the standalone client and server, and packages them as `SaberAccountingSetup.exe`. Open the repository's Actions tab, select **Build Saber Accounting Installer**, run the workflow, and download the **SaberAccountingSetup** artifact. End users do not need Python or GitHub.
 
 ## Version 0.7.1 fresh start
 
@@ -337,7 +293,7 @@ The Import Excel preview includes an All/USD/EUR/LBP/AED selector and Apply butt
 
 ## Version 1.12.0 final release
 
-### Payroll reports and worksheets (Payroll > Payroll Reports & Worksheets)
+### Payroll official reports (Payroll > Official Reports)
 - **R10** quarterly salary tax withholding, **R5** annual employer declaration, **R6** individual annual statement.
 - Any **month, quarter or year**; employees and managers in **separate sections**, plus a grand total.
 - NSSF **employee 3%** and employer medical, family and end-of-service contributions.
@@ -371,11 +327,11 @@ The Import Excel preview includes an All/USD/EUR/LBP/AED selector and Apply butt
 The salary tax method is unchanged: transport and schooling are included in taxable salary, and one-off bonus / 13th salary are annualized ×12 in the month paid. Adjust in Tax & NSSF Settings or ask for a rule change if your practice differs.
 
 ### Build the installer (final workflow)
-1. Upload the contents of this folder to the GitHub repository root (replace the old files, not the user's saved company databases).
+1. Upload this project to the GitHub repository (replace the old files).
 2. Open **Actions**, select **Build Saber Accounting Installer**, click **Run workflow**. It also runs automatically on every push to `main`.
 3. When it finishes, download the **SaberAccountingSetup** artifact and run `SaberAccountingSetup.exe`.
 
-One installer only: no Python, no manual server. The data service starts automatically inside the app, and company data stays in the user's `SaberAccounting` folder across upgrades. On a new computer, the app asks you to create the initial administrator password (at least 10 characters); sign in as `admin` with that password.
+One installer only: no Python, no manual server. The data service starts automatically inside the app, and company data stays in the user's `SaberAccounting` folder across upgrades. First sign-in on a new computer: `admin` / `admin` (change it in Security > Users).
 
 
 ---
@@ -401,7 +357,7 @@ One installer only: no Python, no manual server. The data service starts automat
 
 ## Inventory (Lebanese periodic method)
 - Purchases stay in 601. Stock quantities and costs come from the stock documents.
-- Costing: company-wide moving weighted average (default), allocating each warehouse's on-hand units at the current company-wide average, or FIFO by warehouse (transfers carry the oldest source warehouse cost layers). Stock can never go negative in a warehouse.
+- Costing: weighted average (default) or FIFO. Stock can never go negative in a warehouse.
 - A Sales Invoice line with an Item code issues the stock automatically (Stock Issue linked to the invoice; deleting or cancelling the invoice removes it).
 - Reports: Stock Valuation (at any date, by warehouse, at cost and at sales price), Stock Card, Stock Movements, Sales Margin (COGS), Reorder, Slow-moving stock. Excel, PDF and print.
 - Year end: the Stock Variation voucher (type 06) cancels account 37 against 6051 and books the closing stock (Dr 37 / Cr 6052). It is posted automatically when the year is closed, and the closing stock becomes the Opening Stock of the next year.
@@ -413,34 +369,26 @@ One installer only: no Python, no manual server. The data service starts automat
 4. "Delete Closing & Reopen Year" undoes everything if a correction is needed.
 
 ## Points to confirm with the accountant
-- NSSF branch contribution percentages against the current implementing decrees (the configured 3% employee, 8% employer medical, 6% family, and 8.5% end-of-service rates are not fully primary-source verified here).
-- Exact start dates of the January-April 2024 NSSF ceilings and any minimum-wage change applied partway through a month.
+- Employer NSSF sickness & maternity rate (8% per PwC; one source says 11%).
+- Exact start dates of Jan-Feb 2024 ceilings and the 28M minimum wage.
 - VAT declaration box numbers against the official MoF form; rounding of the deduction ratio.
 
 # Version 2.1.0
 
 ## Arabic in PDF
-Every PDF (reports, statements, invoices, VAT declaration, R5 / R6 / R10, NSSF statement) prints Arabic text correctly - joined letters, right-to-left - using the Amiri font (SIL Open Font License, `assets/fonts/Amiri-OFL.txt`). Reports carry Arabic labels next to the English.
+Every PDF (reports, statements, invoices, VAT declaration, R5 / R6 / R10, NSSF statement) prints Arabic text correctly - joined letters, right-to-left - using the Amiri font (SIL Open Font License, `assets/fonts/Amiri-OFL.txt`). Official reports carry Arabic labels next to the English.
 
 ## NSSF ceilings - automatic and monthly
-- A new or never-configured company loads the app's Lebanese payroll defaults for 2024-2026 (ceilings, configurable rates, family allowances, tax rounding). Settings you changed yourself are never overwritten; the "Load Lebanese Payroll Rules" action reloads them on request.
-- Payroll is monthly: each payroll uses the rules in force on the **last day of its month** (for example the 90M -> 140M sickness-and-maternity ceiling change of August 2025, or the LBP 10,000 rounding from 25-11-2024 for November). Retroactive pay uses the ceilings of each of its own months.
-- Payroll > Payroll Reports & Worksheets > "CEILINGS - NSSF ceilings by month" shows the ceilings and rates of every month of a year.
+- A new or never-configured company loads the Lebanese periods 2024-2026 automatically (ceilings, rates, family allowances, tax rounding). Settings you changed yourself are never overwritten; "Load Lebanese Law 2024-2026" reloads them on request.
+- Payroll is monthly: each payroll uses the rules in force on the **last day of its month** (for example the 90M -> 120M ceiling change of August 2025, or the LBP 10,000 rounding from 25-11-2024 for November). Retroactive pay uses the ceilings of each of its own months.
+- Payroll > Official Reports > "CEILINGS - NSSF ceilings by month" shows the ceilings and rates of every month of a year.
 
 ## NSSF payment format
-Payroll > Payroll Reports & Worksheets > "NSSF - Contributions statement (payment)", monthly or quarterly, Arabic / English:
-- per employee and month: NSSF number, salary subject, capped bases and contributions for sickness & maternity, family allowances and end of service using the saved rates, family allowances already paid, net due;
+Payroll > Official Reports > "NSSF - Contributions statement (payment)", monthly or quarterly, Arabic / English:
+- per employee and month: NSSF number, salary subject, capped bases and contributions for sickness & maternity (employee 3% + employer), family allowances (6%) and end of service (8.5%), family allowances already paid, net due;
 - payment summary by branch and the net amount payable to the NSSF (LBP);
 - the monthly ceilings and rates applied; employer NSSF number from General Settings.
 "Record NSSF Payment" books the payment voucher (Dr NSSF payable / Cr cash or bank).
-
-## Payroll and NSSF compliance limits
-- The current CNSS notices support the sickness-and-maternity ceiling of LBP 140M and minimum wage of LBP 28M from 1 August 2025 (Memo 801), and the family-branch ceiling of LBP 28M plus revised allowances from 1 May 2026 (Memo 831). The family ceiling of LBP 18M begins 1 July 2025 (Memo 793).
-- CNSS Contribution System 11, Article 1, defines covered earnings broadly. Accordingly, the NSSF base includes transport and schooling allowances even when part of those amounts is exempt from salary tax. Supporting expense reimbursements are different and require proof.
-- The consolidated Social Security Law (through 31 August 2026) delegates contribution percentages to implementing decrees. The app’s configurable 3% employee, 8% sickness-and-maternity employer, 6% family, and 8.5% end-of-service rates have not been fully verified here against the current primary decrees; verify the applicable rates before filing or paying. Existing user-saved settings are preserved, so inspect old company files for legacy rates before use.
-- Foreign-worker EOS eligibility is category- and agreement-dependent; nationality alone is not sufficient. The app’s nationality/age shortcut is warning-bearing and must not be relied on without checking the employee’s CNSS category. Spouse-working family-tax deduction allocation and minimum-wage treatment for a partial month also require confirmation.
-- R5, R6, and R10 exports are preparation/reconciliation worksheets, not the current MoF forms or electronic submissions. The Ministry lists R5/R6/R7 XML filing resources; this app does not generate those official submissions (including R7). NSSF statements and annual settlements are also review worksheets, not CNSS filings. The app’s automatic 10-employee monthly/quarterly period choice is only a suggestion: CNSS Law Article 72 addresses fixed contributions for small establishments, not a verified filing-frequency threshold.
-- Primary references checked: [CNSS Memo 801](https://www.cnss.gov.lb/59-%D9%83%D8%B1%D9%83%D9%8A-%D8%A2%D9%84%D9%8A%D9%91%D8%A9-%D8%A7%D8%AD%D8%AA%D8%B3%D8%A7%D8%A8-%D8%A7%D8%B4%D8%AA%D8%B1%D8%A7%D9%83%D8%A7%D8%AA-%D8%A7%D9%84%D8%B6%D9%85%D8%A7%D9%86-%D8%A8%D8%B9), [CNSS Memo 831](https://www.cnss.gov.lb/41-%D9%83%D8%B1%D9%83%D9%8A-%D8%B2%D9%8A%D8%A7%D8%AF%D8%A9-%D8%A7%D9%84%D8%AA%D8%B9%D9%88%D9%8A%D8%B6%D8%A7%D8%AA-%D8%A7%D9%84%D8%B9%D8%A7%D8%A6%D9%84%D9%8A%D9%91%D8%A9-%D9%84%D9%84%D8%B9%D9%85-2), [CNSS laws and systems](https://www.cnss.gov.lb/%D8%A7%D9%84%D9%82%D9%88%D8%A7%D9%86%D9%8A%D9%86-%D9%88%D8%A7%D9%84%D8%A3%D9%86%D8%B8%D9%85%D8%A9), [MoF wages page](https://www.finance.gov.lb/ar-lb/Taxation/Individuals/D-S/Pages/Tax-on-DASS.aspx), and [MoF Citizen Budget 2024](https://finance.gov.lb/en-us/Finance/BI/ABDP/Annual%20Budget%20Documents%20and%20Process/Citizen%20Budget%202024-ENG.pdf).
 
 ## Fix
 Company files created by older versions are brought up to date automatically when they are opened.

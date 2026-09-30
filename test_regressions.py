@@ -4,13 +4,12 @@ import tempfile
 import threading
 import time
 import unittest
-from io import BytesIO
 from pathlib import Path
 
 from backup_service import backup_all
 from client import ApiClient
 from database import Database
-from server import ApiHandler, MAX_REQUEST_BODY_BYTES, run_server
+from server import run_server
 from pdf_import import read_invoice_pdf_pages
 
 
@@ -63,46 +62,10 @@ class DataSafetyTest(unittest.TestCase):
         staff.select_company_year("wrong-company",2024)
         with self.assertRaisesRegex(RuntimeError,"Company not found"): staff.invoices()
 
-    def test_viewer_cannot_export_database_backups(self):
-        admin=ApiClient(self.url); admin.login("admin","secret12345")
-        company=admin.companies()[0]; admin.select_company_year(company["id"],2024)
-        admin.save_user({"username":"read_only","password":"readonly123","role":"viewer"})
-        viewer=ApiClient(self.url); viewer.login("read_only","readonly123"); viewer.select_company_year(company["id"],2024)
-        with self.assertRaisesRegex(RuntimeError,"Backup access"):
-            viewer.backups()
-        with self.assertRaisesRegex(RuntimeError,"Backup access"):
-            viewer.download_backup("anything.db")
-
     def test_background_backup_runs_without_application(self):
         created=backup_all(self.database)
         self.assertTrue(created)
         self.assertEqual(backup_all(self.database),[])
-
-    def test_api_rejects_oversized_body_before_reading_it(self):
-        class Headers(dict):
-            def get(self,key,default=None): return super().get(key,default)
-        class FakeHandler:
-            headers=Headers({"Content-Length":str(MAX_REQUEST_BODY_BYTES+1)})
-            rfile=BytesIO(b"")
-            close_connection=False
-            def _json(self,status,body): self.response=(status,body)
-
-        handler=FakeHandler()
-        ApiHandler.do_POST(handler)
-        self.assertEqual(handler.response[0],413)
-        self.assertIn("22 MB",handler.response[1]["error"])
-        self.assertTrue(handler.close_connection)
-
-    def test_fixed_asset_rollforward_api_returns_fiscal_year(self):
-        admin=ApiClient(self.url); admin.login("admin","secret12345")
-        company=admin.companies()[0]; admin.select_company_year(company["id"],2024)
-        admin.save_asset({"asset_code":"API-ROLLFORWARD","name":"API Test Asset","acquired_on":"01-01-2024",
-            "start_on":"01-01-2024","currency":"USD","cost":"1000","residual":"0","useful_months":12,
-            "frequency":"monthly","asset_account":"211","depreciation_account":"6811","accumulated_account":"2811"})
-        report=admin.asset_rollforward(2024)
-        self.assertEqual(report["year"],2024)
-        self.assertIn("USD",report["totals"])
-        self.assertIn("API-ROLLFORWARD",[row["asset_code"] for row in report["items"]])
 
     def test_failed_payment_edit_preserves_existing_record(self):
         db=Database(self.company_database())  # 2.9.20: company data is in companies/<Company Name>/

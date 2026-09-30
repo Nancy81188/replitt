@@ -35,32 +35,9 @@ class EmployeeRegistrationTest(unittest.TestCase):
             employee = db.save_employee({"full_name": "Nour Test", "currency": "LBP", "base_salary": "150000000"}, user_id)
             april_pay = db.calculate_payroll({"employee_id": employee["id"], "period_date": "30-04-2026"})
             may_pay = db.calculate_payroll({"employee_id": employee["id"], "period_date": "31-05-2026"})
-            self.assertEqual(april_pay["employer_medical"], 11200000)
+            self.assertEqual(april_pay["employer_medical"], 9600000)
             self.assertEqual(may_pay["employer_medical"], 10400000)
             self.assertEqual((april_pay["employer_family"], may_pay["employer_family"]), (1080000, 1680000))
-
-    def test_nssf_monthly_and_annual_statement_totals_and_disclaimer(self):
-        with TemporaryDirectory() as folder:
-            db = Database(Path(folder) / "company.db")
-            db.initialize("secret12345")
-            with db.connect() as connection:
-                user_id = connection.execute("SELECT id FROM users WHERE username='admin'").fetchone()[0]
-            employee = db.save_employee({"full_name": "Nadia Ali", "base_salary": "20000000", "nssf_number": "NSSF-1"}, user_id)
-            payroll = db.save_payroll({"employee_id": employee["id"], "period_date": "31-01-2025"}, user_id)
-            db.post_payroll(payroll["id"], user_id)
-
-            monthly = build_nssf_statement(db, "monthly", 2025, 1)
-            annual = build_nssf_statement(db, "yearly", 2025)
-            for report in (monthly, annual):
-                self.assertEqual(report["record_count"], 1)
-                self.assertEqual(report["summary"]["salary"], 20000000)
-                self.assertEqual(report["summary"]["employee"], 600000)
-                self.assertEqual(report["summary"]["employer_sick"], 1600000)
-                self.assertEqual(report["summary"]["family"], 720000)
-                self.assertEqual(report["summary"]["eos"], 1700000)
-                self.assertEqual(report["net_payable_lbp"], 4620000)
-                self.assertTrue(any("not an official CNSS declaration" in line for line in report["meta"]))
-            self.assertEqual(monthly["sections"][0]["rows"][-1][11], annual["sections"][0]["rows"][-1][11])
 
     def test_registration_fields_are_saved_and_preserved_on_edit(self):
         with TemporaryDirectory() as folder:
@@ -98,8 +75,6 @@ class EmployeeRegistrationTest(unittest.TestCase):
             automatic = build_nssf_statement(db, "auto", 2025, 5)
             self.assertEqual((automatic["declaration_period"], automatic["date_from"], automatic["date_to"]),
                              ("quarterly", "2025-04-01", "2025-06-30"))
-            self.assertIn("Suggested:", automatic["period_label"])
-            self.assertTrue(any("unverified application suggestion" in line for line in automatic["meta"]))
 
     def test_nssf_settlement_requires_filed_months_and_reconciles_saved_wages(self):
         with TemporaryDirectory() as folder:

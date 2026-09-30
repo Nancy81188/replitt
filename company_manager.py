@@ -39,34 +39,19 @@ class CompanyManager:
     def safe_name(name, fallback="company"):
         """The company name as it can be used for a Windows folder / file name (same rule as the backups)."""
         text="".join(ch for ch in str(name or "") if ch.isalnum() or ch in " -_&.").strip()
-        if text not in ("", ".", ".."): return text
-        safe_fallback="".join(ch for ch in str(fallback or "") if ch.isalnum() or ch in " -_&.").strip()
-        return safe_fallback if safe_fallback not in ("", ".", "..") else "company"
+        return text or fallback
 
     def company_folder(self, company, data=None):
         """companies/<Company Name>/ - two companies with the same name get their id added."""
         safe=self.safe_name(company.get("name"),company.get("id") or "company")
         others=[c for c in (data or self._read())["companies"] if c.get("id")!=company.get("id")]
         if any(self.safe_name(c.get("name"),c.get("id")).casefold()==safe.casefold() for c in others): safe=f'{safe} ({company.get("id")})'
-        folder=(self.root/safe).resolve()
-        if self.root.resolve() not in folder.parents: raise ValueError("Company folder must stay inside the companies directory")
-        return folder
+        return self.root/safe
 
     def year_file(self, company, year, data=None):
         """companies/<Company Name>/<Company Name>_<year>.db - named like the backups (<Company Name>_<year>_<date>.db)."""
         folder=self.company_folder(company,data)
         return folder/f"{folder.name}_{int(year)}.db"
-
-    def _database_path(self,value):
-        path=Path(value).resolve()
-        company_directory=self.root.resolve()
-        if path==self.master_path:
-            return path
-        if path.suffix.lower()==".db" and (
-            company_directory in path.parents or path.parent==self.master_path.parent
-        ):
-            return path
-        raise ValueError("Company database path must be inside the application data directory")
 
     def organize_files(self, only_company_id=None):
         """Move every company-year file to companies/<Company Name>/<Company Name>_<year>.db.
@@ -81,9 +66,7 @@ class CompanyManager:
         for company in data["companies"]:
             if only_company_id and company.get("id")!=only_company_id: continue
             for fiscal in company.get("years",[]):
-                try: source=self._database_path(fiscal["database"])
-                except (KeyError,TypeError,ValueError): continue
-                target=self.year_file(company,fiscal["year"],data).resolve()
+                source=Path(fiscal["database"]).resolve(); target=self.year_file(company,fiscal["year"],data).resolve()
                 if source==target or not source.exists(): continue
                 if target.exists(): continue  # never overwrite; resolve by hand
                 cached=self._cache.pop(str(source),None)
@@ -138,7 +121,7 @@ class CompanyManager:
         years=company.get("years",[])
         selected=next((y for y in years if int(y["year"])==int(year)),None) if year else (max(years,key=lambda y:int(y["year"])) if years else None)
         if not selected: raise KeyError("Fiscal year not found")
-        path=str(self._database_path(selected["database"]))
+        path=str(Path(selected["database"]).resolve())
         if path not in self._cache:
             database=Database(path,pooled=self.pooled)
             safe=self.safe_name(company["name"],company["id"])
@@ -178,7 +161,7 @@ class CompanyManager:
         if "active" in item: company["active"]=bool(item["active"])
         self._write(data)
         for year in company.get("years",[]):
-            db=Database(self._database_path(year["database"]))
+            db=Database(year["database"])
             with db.connect() as connection:
                 connection.execute("INSERT INTO app_settings(key,value) VALUES('company_name',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(company["name"],))
         # A renamed company: its files and its backups folder follow the new name.
@@ -191,14 +174,12 @@ class CompanyManager:
         return next(c for c in self._read()["companies"] if c["id"]==company_id)
 
     def create_year(self,company_id,year,user_id):
-        year=int(year)
-        if year<2000 or year>2100: raise ValueError("Enter a valid fiscal year")
-        data=self._read(); company=next((c for c in data["companies"] if c["id"]==company_id),None)
+        year=int(year); data=self._read(); company=next((c for c in data["companies"] if c["id"]==company_id),None)
         if not company: raise KeyError("Company not found")
         if any(int(y["year"])==year for y in company["years"]): raise ValueError("Fiscal year already exists")
         previous=max((y for y in company["years"] if int(y["year"])<year),key=lambda y:int(y["year"]),default=None)
         if not previous: raise ValueError("Create fiscal years in chronological order")
-        source=Database(self._database_path(previous["database"]))
+        source=Database(previous["database"])
         import fixed_assets
         fixed_assets.check_carry_forward(source,year)
         path=self.year_file(company,year,data); path.parent.mkdir(parents=True,exist_ok=True); target=Database(path); target.initialize(secrets.token_urlsafe(24)); self._copy_master_data(source,target)
@@ -211,6 +192,7 @@ class CompanyManager:
     def delete_year(self,company_id,year,user_id):
         """Remove the LAST fiscal year of a company (for example to redo the opening). The file is kept as a backup
         in the company's 'deleted_years' folder, and the previous year is reopened (its closing is removed)."""
+        import shutil
         from datetime import datetime as _dt
         year=int(year); data=self._read(); company=next((c for c in data["companies"] if c["id"]==company_id),None)
         if not company: raise KeyError("Company not found")
@@ -219,48 +201,16 @@ class CompanyManager:
         if not current: raise ValueError(f"Fiscal year {year} was not found for this company")
         if int(years[-1]["year"])!=year: raise ValueError(f"Only the last fiscal year can be deleted ({years[-1]['year']}). Delete the later years first.")
         if len(years)==1: raise ValueError("The only fiscal year of a company cannot be deleted")
-        path=self._database_path(current["database"])
+        path=Path(current["database"]).resolve()
         if path==self.master_path.resolve(): raise ValueError("This year uses the main database file and cannot be deleted")
         backup_folder=self.company_folder(company,data)/"deleted_years"; backup_folder.mkdir(parents=True,exist_ok=True)
-        token=uuid.uuid4().hex[:8]
-        backup=backup_folder/f"{year}_deleted_{_dt.now():%Y%m%d_%H%M%S}_{token}.db"
-        temporary=backup.with_suffix(".partial")
-        retired=path.with_name(f"{path.name}.deleting-{token}")
+        backup=backup_folder/f"{year}_deleted_{_dt.now():%Y%m%d_%H%M%S}.db"
+        cached=self._cache.pop(str(path),None)
+        if cached is not None: cached.release()  # close the open file handle so it can be moved (Windows)
+        if path.exists(): shutil.move(str(path),str(backup))
+        company["years"]=[y for y in company["years"] if int(y["year"])!=year]
         previous=years[-2]
-        # A WAL-mode .db alone can omit committed transactions. Snapshot through SQLite
-        # while blocking other requests for this company-year, then verify the archive.
-        database=self.database(company_id,year)
-        with database._lock:
-            cached=self._cache.pop(str(path),None)
-            if cached is not None: cached.release()
-            if not path.is_file(): raise ValueError("The fiscal-year database file was not found; the year was not deleted")
-            try:
-                with closing(sqlite3.connect(path.resolve().as_uri()+"?mode=ro",uri=True)) as source, \
-                     closing(sqlite3.connect(str(temporary))) as archive:
-                    source.backup(archive)
-                Database._validate_backup_file(temporary)
-                # Refuse to remove a file with readers holding an uncheckpointed WAL.
-                with closing(sqlite3.connect(str(path))) as source:
-                    if source.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]:
-                        raise ValueError("Close other programs using this fiscal year before deleting it")
-                try:
-                    path.replace(retired)
-                except PermissionError as exc:
-                    raise ValueError("Close other programs using this fiscal year before deleting it") from exc
-                try:
-                    temporary.replace(backup)
-                    company["years"]=[y for y in company["years"] if int(y["year"])!=year]
-                    self._write(data)
-                except Exception:
-                    retired.replace(path)
-                    raise
-            finally:
-                if temporary.exists(): temporary.unlink()
-            for suffix in ("-wal","-shm"):
-                try: Path(str(path)+suffix).unlink()
-                except OSError: pass
-            try: retired.unlink()
-            except OSError: pass  # archive is verified; leave a second copy rather than risk data loss
+        self._write(data)
         reopened=self.reopen_year(company_id,int(previous["year"]),user_id)
         return {"deleted_year":year,"backup":str(backup),"reopened_year":int(previous["year"]),"removed_closing_entries":reopened.get("removed_closing_entries",0),
                 "company":reopened["company"]}
@@ -270,12 +220,12 @@ class CompanyManager:
         if not company: raise KeyError("Company not found")
         current=next((item for item in company.get("years",[]) if int(item["year"])==year),None)
         if not current: raise ValueError("Fiscal year not found for this company")
-        result=Database(self._database_path(current["database"])).reopen_fiscal_year(year,user_id)
+        result=Database(current["database"]).reopen_fiscal_year(year,user_id)
         current["status"]="open"
         next_year=next((item for item in company.get("years",[]) if int(item["year"])==year+1),None)
         removed_opening=0
         if next_year:
-            with Database(self._database_path(next_year["database"])).connect() as db:
+            with Database(next_year["database"]).connect() as db:
                 ids=[row["id"] for row in db.execute("SELECT id FROM journal_entries WHERE source_type='opening' AND entry_number LIKE ?",(f"OPEN-{year+1}-%",))]
                 for entry_id in ids: db.execute("DELETE FROM journal_entries WHERE id=?",(entry_id,))
                 removed_opening=len(ids)
@@ -286,7 +236,7 @@ class CompanyManager:
         source_record=next((item for item in company.get("years",[]) if int(item["year"])==source_year),None)
         target_record=next((item for item in company.get("years",[]) if int(item["year"])==target_year),None)
         if not source_record or not target_record: raise ValueError(f"Both fiscal years {source_year} and {target_year} must exist")
-        source=Database(self._database_path(source_record["database"])); target=Database(self._database_path(target_record["database"]))
+        source=Database(source_record["database"]); target=Database(target_record["database"])
         with target.connect() as db:
             ids=[row["id"] for row in db.execute("SELECT id FROM journal_entries WHERE source_type='opening' AND entry_number LIKE ?",(f"OPEN-{target_year}-%",))]
             for entry_id in ids: db.execute("DELETE FROM journal_entries WHERE id=?",(entry_id,))
@@ -305,15 +255,14 @@ class CompanyManager:
         current=next((y for y in company.get("years",[]) if int(y["year"])==year),None)
         if not current: raise ValueError("Fiscal year not found for this company")
         next_record=next((item for item in company.get("years",[]) if int(item["year"])==next_year),None)
-        source=Database(self._database_path(current["database"]))
+        source=Database(current["database"])
         source_backup=source.backup("safety")
-        next_path=self._database_path(next_record["database"]) if next_record else None
-        target_backup=Database(next_path).backup("safety") if next_path else None
+        target_backup=Database(next_record["database"]).backup("safety") if next_record else None
         try:
             close_result=source.close_fiscal_year(year,user_id)
             current["status"]="closed"
             if next_record:
-                path=next_path; target=Database(path)
+                path=Path(next_record["database"]); target=Database(path)
                 with target.connect() as db:
                     ids=[row["id"] for row in db.execute("SELECT id FROM journal_entries WHERE source_type='opening' AND entry_number LIKE ?",(f"OPEN-{next_year}-%",))]
                     for entry_id in ids: db.execute("DELETE FROM journal_entries WHERE id=?",(entry_id,))
@@ -330,7 +279,7 @@ class CompanyManager:
             # Restore both company-year files to their pre-close state; keep the safety copies.
             with closing(sqlite3.connect(source_backup)) as old,closing(sqlite3.connect(source.path)) as live: old.backup(live)
             if target_backup:
-                with closing(sqlite3.connect(target_backup)) as old,closing(sqlite3.connect(next_path)) as live: old.backup(live)
+                with closing(sqlite3.connect(target_backup)) as old,closing(sqlite3.connect(next_record["database"])) as live: old.backup(live)
             raise
         return {**close_result,"company":company,"opening_vouchers":opening_vouchers,"stock_openings":stock_openings}
 

@@ -31,25 +31,6 @@ class AssetAndDoeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"cannot be deleted"):
             fixed_assets.delete_asset(self.db,asset["id"])
 
-    def test_asset_rollforward_separates_posted_and_unposted_depreciation(self):
-        first=fixed_assets.save_asset(self.db,{"asset_code":"LAP-1","name":"Laptop","acquired_on":"01-01-2024",
-            "start_on":"01-01-2024","currency":"USD","cost":"1200","residual":"120","useful_months":12,
-            "frequency":"monthly","asset_account":"211","depreciation_account":"6811","accumulated_account":"2811"})
-        fixed_assets.post_period(self.db,first["id"],"31-01-2024",1,2024)
-        fixed_assets.save_asset(self.db,{"asset_code":"CAR-1","name":"Vehicle","acquired_on":"01-06-2024",
-            "start_on":"01-06-2024","currency":"USD","cost":"6000","residual":"0","useful_months":60,
-            "frequency":"monthly","asset_account":"211","depreciation_account":"6811","accumulated_account":"2811"})
-
-        report=fixed_assets.rollforward(self.db,2024)
-        laptop=next(row for row in report["items"] if row["asset_code"]=="LAP-1")
-        totals=report["totals"]["USD"]
-        self.assertEqual((laptop["opening_cost"],laptop["additions"],laptop["closing_cost"]),("0.00","1200.00","1200.00"))
-        self.assertEqual((laptop["opening_accumulated"],laptop["depreciation_posted"],laptop["closing_net_book_value"]),
-                         ("0.00","90.00","1110.00"))
-        self.assertEqual(laptop["unposted_scheduled"],"990.00")
-        self.assertEqual((totals["additions"],totals["depreciation_posted"],totals["closing_net_book_value"]),
-                         ("7200.00","90.00","7110.00"))
-
     def test_yearly_amortisation_sums_partial_years(self):
         asset=fixed_assets.save_asset(self.db,{"asset_code":"EQ-1","name":"Equipment","acquired_on":"01-03-2024",
             "start_on":"01-03-2024","currency":"USD","cost":"1200","residual":"0","useful_months":12,

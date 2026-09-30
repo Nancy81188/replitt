@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import os
-import ctypes
 import tkinter as tk
 import sys
 import traceback
 import mimetypes
 import time
 import json
-import uuid
+from urllib.request import urlopen
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -18,13 +17,11 @@ from client import ApiClient
 from i18n import tr
 from report_export import export_excel, export_invoice_pdf, export_pdf, print_rows
 from desktop_final import FinalFeaturesMixin
-from cnss_forms_ui import CNSSFormsMixin
 from desktop_brains import BrainsScreensMixin
 from desktop_dimensions import DimensionsMixin
 from desktop_stage3 import Stage3Mixin
 from desktop_inventory import InventoryMixin
 from desktop_v22 import V22Mixin
-from party_similarity import similar_parties
 
 NAVY, GOLD, LIGHT = "#102A43", "#B78B45", "#F4F7FA"
 SALE_TREATMENTS={"Taxable 11%":"standard","Zero-rated (export)":"zero_rated","Exempt (Art. 16-17)":"exempt","Out of scope":"out_of_scope"}
@@ -64,14 +61,6 @@ def sortable_date(value):
         except ValueError: pass
     return datetime.min
 
-def initial_window_size(screen_width, screen_height, dpi_scale=1.0):
-    """Keep the initial window and its minimum size inside compact displays."""
-    available_width=max(1,screen_width-32)
-    available_height=max(1,screen_height-72)
-    width=min(round(1180*dpi_scale),available_width)
-    height=min(round(720*dpi_scale),available_height)
-    return width,height,min(round(760*dpi_scale),width),min(round(480*dpi_scale),height)
-
 def parse_user_date(value):
     text=str(value or "").strip()
     for pattern in ("%d-%m-%Y","%d%m%Y","%Y-%m-%d","%Y%m%d"):
@@ -92,27 +81,13 @@ def natural_sort_value(value):
     try: return (0,float(text.replace(",","")))
     except ValueError: return (1,text.casefold())
 
-def _enable_windows_dpi_awareness():
-    """Let Windows report real monitor dimensions before Tk chooses the initial window size."""
-    if sys.platform!="win32": return
-    try:
-        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)): return
-    except (AttributeError,OSError):
-        pass
-    try: ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except (AttributeError,OSError): pass
-
-class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScreensMixin, FinalFeaturesMixin, CNSSFormsMixin, tk.Tk):
+class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScreensMixin, FinalFeaturesMixin, tk.Tk):
     def __init__(self):
-        _enable_windows_dpi_awareness()
         super().__init__()
-        self.title("Saber Accounting 2.9.27")
+        self.title("Saber Accounting 2.9.23")
         screen_width, screen_height = self.winfo_screenwidth(), self.winfo_screenheight()
-        try: dpi_scale=max(1.0,min(2.0,self.winfo_fpixels("1i")/96.0))
-        except tk.TclError: dpi_scale=1.0
-        width,height,min_width,min_height=initial_window_size(screen_width,screen_height,dpi_scale)
-        self.geometry(f"{width}x{height}")
-        self.minsize(min_width,min_height)
+        self.geometry(f"{min(1180, screen_width)}x{min(720, screen_height)}")
+        self.minsize(min(760, screen_width), min(480, screen_height))
         if sys.platform == "win32":
             try: self.state("zoomed")
             except tk.TclError: pass
@@ -346,7 +321,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         """Customers / suppliers search whose choice is written into any field."""
         try: parties = self.client.parties()
         except Exception as exc: return messagebox.showerror("Customers / Suppliers", str(exc))
-        window = tk.Toplevel(self); window.title("Customers / Suppliers - Search"); self.fit_dialog(window,700,420); window.configure(bg=LIGHT); window.transient(self); window.grab_set()
+        window = tk.Toplevel(self); window.title("Customers / Suppliers - Search"); window.geometry("700x420"); window.configure(bg=LIGHT); window.transient(self); window.grab_set()
         search = tk.StringVar(); entry = tk.Entry(window, textvariable=search, width=40); entry.pack(padx=10, pady=8); entry.focus_set()
         tree = ttk.Treeview(window, columns=("name", "account", "kind", "currency"), show="headings"); tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         for key, label, width in (("name", "Name", 300), ("account", "Account", 110), ("kind", "Type", 90), ("currency", "Currency", 70)): tree.heading(key, text=label); tree.column(key, width=width)
@@ -525,12 +500,10 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         self.status_bar()
         nav_outer=tk.Frame(self,bg=LIGHT); nav_outer.pack(fill="x",padx=8,pady=(4,0))
         nav_canvas=tk.Canvas(nav_outer,bg=LIGHT,highlightthickness=0,height=56)
-        nav_canvas.pack(side="left",fill="x",expand=True)
-        nav_vertical=ttk.Scrollbar(nav_outer,orient="vertical",command=nav_canvas.yview)
-        nav_vertical.pack(side="right",fill="y")
+        nav_canvas.pack(side="top",fill="x",expand=True)
         nav_scroll=ttk.Scrollbar(nav_outer,orient="horizontal",command=nav_canvas.xview)
         nav_scroll.pack(side="bottom",fill="x")
-        nav_canvas.configure(xscrollcommand=nav_scroll.set,yscrollcommand=nav_vertical.set)
+        nav_canvas.configure(xscrollcommand=nav_scroll.set)
         tab_nav=tk.Frame(nav_canvas,bg=LIGHT)
         nav_window=nav_canvas.create_window((0,0),window=tab_nav,anchor="nw")
         nav_buttons=[]; navigation_columns=None
@@ -548,10 +521,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
                 for index,button in enumerate(nav_buttons):
                     button.grid(row=index//columns,column=index%columns,sticky="nsew",padx=4,pady=3)
             nav_canvas.itemconfigure(nav_window,width=max(nav_canvas.winfo_width(),tab_nav.winfo_reqwidth()))
-            nav_canvas.configure(height=min(100,max(56,tab_nav.winfo_reqheight()+2)),scrollregion=nav_canvas.bbox("all"))
-            if tab_nav.winfo_reqheight()>nav_canvas.winfo_height()+1:
-                if not nav_vertical.winfo_manager(): nav_vertical.pack(side="right",fill="y")
-            elif nav_vertical.winfo_manager(): nav_vertical.pack_forget()
+            nav_canvas.configure(height=max(56,tab_nav.winfo_reqheight()+2),scrollregion=nav_canvas.bbox("all"))
             if tab_nav.winfo_reqwidth()>nav_canvas.winfo_width()+1:
                 if not nav_scroll.winfo_manager(): nav_scroll.pack(side="bottom",fill="x")
             elif nav_scroll.winfo_manager(): nav_scroll.pack_forget()
@@ -622,18 +592,6 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         generation=self._page_generation
         self.after(30,lambda:self._build_next_page(generation))
         self.after(700,lambda:self.show_document_alerts(startup=True))
-
-    def fit_dialog(self,window,width,height,min_width=None,min_height=None):
-        """Scale a dialog for high-DPI screens while keeping it within the available display."""
-        try: scale=max(1.0,min(2.0,self.winfo_fpixels("1i")/96.0))
-        except tk.TclError: scale=1.0
-        screen_width,screen_height=window.winfo_screenwidth(),window.winfo_screenheight()
-        width=min(round(width*scale),screen_width); height=min(round(height*scale),screen_height)
-        min_width=min(round((min_width if min_width is not None else width/scale)*scale),screen_width)
-        min_height=min(round((min_height if min_height is not None else height/scale)*scale),screen_height)
-        x=max(0,(screen_width-width)//2); y=max(0,(screen_height-height)//2)
-        window.minsize(min_width,min_height)
-        window.geometry(f"{width}x{height}+{x}+{y}")
 
     def _run_page_builder(self,build):
         self.__dict__["_building_depth"]=self.__dict__.get("_building_depth",0)+1
@@ -916,7 +874,6 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
                   font=("Segoe UI",9,"bold"),border=0,padx=20,pady=7).pack(side="left",padx=4)
         lifecycle=tk.Frame(self.invoices_tab,bg=LIGHT); lifecycle.pack(fill="x",anchor="w",pady=(0,8))
         self.action_button(lifecycle,"Duplicate",self.duplicate_selected_invoice).pack(side="left",padx=4)
-        self.action_button(lifecycle,"Create Return / Credit Note",self.return_selected_invoice).pack(side="left",padx=4)
         tk.Button(lifecycle,text="Cancel Invoice",command=self.cancel_selected_invoice,bg="#8B1E1E",fg="white",border=0,padx=15,pady=7).pack(side="left",padx=4)
         tk.Button(lifecycle,text="Delete Selected",command=self.delete_selected_invoice,bg="#6B1010",fg="white",border=0,padx=15,pady=7).pack(side="left",padx=4)
         self.action_button(lifecycle,"Attach PDF / Image",self.attach_to_selected_invoice).pack(side="left",padx=4)
@@ -949,9 +906,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         self.invoice_tree.delete(*self.invoice_tree.get_children())
         for r in rows:
             lbp,usd=self.exchange_equivalents(float(r["total"] or 0),r["currency"],rates)
-            entry_label=(("Sales" if r.get("kind")=="sale" else "Supplier")+" Credit Note"
-                         if r.get("doc_subtype")=="credit_note" else r.get("entry_type") or r["kind"])
-            self.invoice_tree.insert("","end",iid=str(r["id"]),values=(r["invoice_number"],"DELETED" if r.get("status")=="deleted" else str(r.get("status") or "").title(),r["invoice_date"],r["party_name"],r.get("branch_name") or "Head Office",entry_label,r["currency"],r.get("deductible_subtotal",r["subtotal"]),r.get("non_deductible_subtotal",0),r["total"],r.get("payment_method") or "",r.get("amount_paid") or 0,"" if lbp is None else f"{lbp:,.2f}","" if usd is None else f"{usd:,.2f}",r["debit"],r["credit"],("Yes" if r.get("vat_recoverable",1) else "NO") if r.get("kind")=="purchase" and float(r.get("vat") or 0) else ""),tags=("deleted",) if r.get("status")=="deleted" else ())
+            self.invoice_tree.insert("","end",iid=str(r["id"]),values=(r["invoice_number"],"DELETED" if r.get("status")=="deleted" else str(r.get("status") or "").title(),r["invoice_date"],r["party_name"],r.get("branch_name") or "Head Office",r.get("entry_type") or r["kind"],r["currency"],r.get("deductible_subtotal",r["subtotal"]),r.get("non_deductible_subtotal",0),r["total"],r.get("payment_method") or "",r.get("amount_paid") or 0,"" if lbp is None else f"{lbp:,.2f}","" if usd is None else f"{usd:,.2f}",r["debit"],r["credit"],("Yes" if r.get("vat_recoverable",1) else "NO") if r.get("kind")=="purchase" and float(r.get("vat") or 0) else ""),tags=("deleted",) if r.get("status")=="deleted" else ())
         self.invoice_tree.tag_configure("deleted",foreground="#8B1E1E")
 
     def vat_classification_dialog(self):
@@ -1036,9 +991,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
                 widget=self.branch_selector(window,variables[key],24,False)
             elif key in ("supplier_account","vat_account","expense_account","expense_no_vat_account"):
                 frame=tk.Frame(window,bg=LIGHT); side_key={"supplier_account":"supplier_side","vat_account":"vat_side","expense_account":"expense_side","expense_no_vat_account":"expense_no_vat_side"}[key]
-                self.account_search_box(frame,variables[key],16,replace_on_focus=True).pack(side="left")
-                tk.Button(frame,text="Find",command=lambda v=variables[key]:self.open_account_lookup(v,include_groups=True),
-                          bg=NAVY,fg="white",border=0,padx=6,pady=2).pack(side="left",padx=(3,0))
+                self.account_search_box(frame,variables[key],18).pack(side="left")
                 ttk.Combobox(frame,textvariable=variables[side_key],values=["D - Debit","C - Credit"],state="readonly",width=10).pack(side="left",padx=(5,0))
                 widget=frame
             elif key in ("invoice_date","due_date"):
@@ -1051,11 +1004,6 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
             values={key:variable.get().strip() for key,variable in variables.items()}
             if not all(values[key] for key in ("invoice_number","invoice_date","party_name")):
                 return messagebox.showwarning("Invoices","Invoice number, date, and customer/supplier are required",parent=window)
-            for key in ("supplier_account","vat_account","expense_account","expense_no_vat_account"):
-                code=values[key].split(" - ",1)[0].strip()
-                if code and not code.replace(".","").isdigit():
-                    return messagebox.showwarning("Invoices",f"Choose a valid {key.replace('_',' ')} from the account list",parent=window)
-                values[key]=code
             try:
                 values["invoice_date"]=formatted_user_date(values["invoice_date"])
                 if values.get("due_date"): values["due_date"]=formatted_user_date(values["due_date"])
@@ -1079,9 +1027,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
 
         exchange_label=tk.Label(window,text=self.exchange_equivalent_text(float(row["total"] or 0),row["currency"]),bg=LIGHT,fg=NAVY,font=("Segoe UI",9,"bold"))
         exchange_label.grid(row=(len(fields)+1)//2,column=0,columnspan=4,pady=(6,0))
-        tk.Label(window,text="Accounts: click the number and type a replacement, or use Find. Tab moves to the next field.",
-                 bg=LIGHT,fg="#5f6b76").grid(row=(len(fields)+1)//2+1,column=0,columnspan=4,pady=(5,0))
-        buttons=tk.Frame(window,bg=LIGHT); buttons.grid(row=(len(fields)+1)//2+2,column=0,columnspan=4,pady=16)
+        buttons=tk.Frame(window,bg=LIGHT); buttons.grid(row=(len(fields)+1)//2+1,column=0,columnspan=4,pady=16)
         tk.Button(buttons,text="Save Update",command=save_update,bg=GOLD,fg=NAVY,font=("Segoe UI",10,"bold"),
                   border=0,padx=24,pady=8).pack(side="left",padx=5)
         tk.Button(buttons,text="Cancel",command=window.destroy,bg=NAVY,fg="white",border=0,padx=20,pady=8).pack(side="left",padx=5)
@@ -1125,91 +1071,6 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
             messagebox.showinfo("Cancel Invoice","Invoice cancelled and reversing journal entry created")
         tk.Button(window,text="Confirm Cancellation",command=confirm,bg="#8B1E1E",fg="white",border=0,padx=18,pady=7).grid(row=1,column=0,columnspan=2,pady=12)
 
-    def return_selected_invoice(self):
-        invoice_id=self.selected_invoice_id()
-        if invoice_id is None: return
-        summary=self.invoice_rows.get(str(invoice_id),{})
-        if summary.get("status")!="posted":
-            return messagebox.showwarning("Return / Credit Note","Only a posted invoice can be returned. Cancellation is a separate action.")
-        if summary.get("doc_subtype")=="credit_note":
-            return messagebox.showwarning("Return / Credit Note","A credit note cannot itself be returned.")
-        try: detail=self.client.invoice_detail(invoice_id)
-        except Exception as exc: return messagebox.showerror("Return / Credit Note",str(exc))
-        invoice=detail["invoice"]; items=detail.get("items") or []
-        return_request_id=str(uuid.uuid4())
-        if not items:
-            return messagebox.showwarning("Return / Credit Note","This invoice has no item lines, so a quantity-reviewed return cannot be safely created.")
-        is_sale=invoice.get("kind")=="sale"; title="Sales Return / Credit Note" if is_sale else "Purchase Return / Supplier Credit Note"
-        window=tk.Toplevel(self); window.title(title); window.configure(bg=LIGHT); window.transient(self); window.grab_set()
-        tk.Label(window,text=f"Return against {invoice['invoice_number']} — {invoice.get('party_name') or ''}",
-                 bg=LIGHT,font=("Segoe UI",10,"bold")).pack(anchor="w",padx=12,pady=(12,4))
-        tk.Label(window,text="Enter quantities to return. Value and VAT are calculated proportionally from the posted lines.\n"
-                 "This creates a linked credit note only; it does not refund cash or allocate a payment.",
-                 bg=LIGHT,fg="#5f6b76",justify="left").pack(anchor="w",padx=12,pady=(0,8))
-        date_line=tk.Frame(window,bg=LIGHT); date_line.pack(anchor="w",padx=12,pady=4)
-        tk.Label(date_line,text="Return date (DD-MM-YYYY)",bg=LIGHT).pack(side="left")
-        date_var=tk.StringVar(value=self.fiscal_today()); tk.Entry(date_line,textvariable=date_var,width=14).pack(side="left",padx=7)
-        grid=tk.Frame(window,bg=LIGHT); grid.pack(fill="both",expand=True,padx=12,pady=6)
-        for col,label in enumerate(("Description","Original Qty","Returned","Available","Return Qty","Line incl. VAT")):
-            tk.Label(grid,text=label,bg=NAVY,fg="white",padx=5,pady=4).grid(row=0,column=col,sticky="ew")
-        qty_vars={}
-        def preview_value(record,qty,available):
-            if not available: return 0.0
-            ratio=Decimal(str(qty))/Decimal(str(available)); cent=Decimal("0.01")
-            fields=(("deductible_subtotal","returned_deductible_subtotal"),
-                    ("non_deductible_subtotal","returned_non_deductible_subtotal"),("vat","returned_vat"))
-            return float(sum(((Decimal(str(record.get(source) or 0))-Decimal(str(record.get(returned) or 0)))*ratio)
-                             .quantize(cent,rounding=ROUND_HALF_UP) for source,returned in fields))
-        for index,line in enumerate(items,1):
-            original=float(line.get("quantity") or 0); already=float(line.get("returned_quantity") or 0); available=max(0,original-already)
-            tk.Label(grid,text=line["description"],bg=LIGHT,anchor="w").grid(row=index,column=0,sticky="w",padx=4,pady=3)
-            for col,value in ((1,original),(2,already),(3,available)):
-                tk.Label(grid,text=f"{value:g}",bg=LIGHT).grid(row=index,column=col,padx=4,pady=3)
-            var=tk.StringVar(value="0"); qty_vars[int(line["id"])]=(var,line,available)
-            entry=tk.Entry(grid,textvariable=var,width=10,justify="right"); entry.grid(row=index,column=4,padx=4,pady=3)
-            amount=tk.StringVar(value="0.00")
-            tk.Label(grid,textvariable=amount,bg=LIGHT,anchor="e").grid(row=index,column=5,sticky="e",padx=4,pady=3)
-            def update_amount(*_args,v=var,record=line,limit=available,out=amount):
-                try:
-                    qty=float(v.get() or 0)
-                    if qty<0 or qty>limit: raise ValueError
-                    out.set(f"{preview_value(record,qty,limit):,.2f}")
-                except (ValueError,ZeroDivisionError): out.set("Review quantity")
-            var.trace_add("write",update_amount)
-        total_label=tk.StringVar(value="Total credit note: 0.00 "+str(invoice.get("currency") or ""))
-        tk.Label(window,textvariable=total_label,bg=LIGHT,fg=NAVY,font=("Segoe UI",10,"bold")).pack(anchor="e",padx=16,pady=4)
-        def update_total(*_args):
-            try:
-                total=0.0
-                for var,line,available in qty_vars.values():
-                    qty=float(var.get() or 0)
-                    if qty<0 or qty>available: raise ValueError
-                    total+=preview_value(line,qty,available)
-                total_label.set(f"Total credit note: {total:,.2f} {invoice.get('currency') or ''}")
-            except (ValueError,ZeroDivisionError): total_label.set("Correct quantities to see the credit-note total")
-        for var,_,_ in qty_vars.values(): var.trace_add("write",update_total)
-        def save_return():
-            try:
-                parsed_date=formatted_user_date(date_var.get().strip())
-                selections=[]
-                for item_id,(var,line,available) in qty_vars.items():
-                    value=float(var.get().replace(",","") or 0)
-                    if value<0 or value>available: raise ValueError(f"{line['description']}: quantity must be from 0 to {available:g}")
-                    if value: selections.append({"item_id":item_id,"quantity":str(value)})
-                if not selections: raise ValueError("Enter at least one quantity to return")
-                if not messagebox.askyesno(title,f"Post the reviewed return against {invoice['invoice_number']}?\n"
-                        "A credit note and any applicable stock reversal will be created. No cash refund or payment allocation is created.",parent=window):
-                    return
-                created=self.client.create_invoice_return(invoice_id,selections,parsed_date,return_request_id)
-            except Exception as exc:
-                return messagebox.showerror(title,str(exc),parent=window)
-            window.destroy(); self.load_invoices(); self.load_dashboard(); self.load_journal(); self.load_trial()
-            messagebox.showinfo(title,f"Posted {created['invoice_number']} linked to {invoice['invoice_number']}. "
-                              "No cash refund or allocation was created.")
-        buttons=tk.Frame(window,bg=LIGHT); buttons.pack(pady=10)
-        tk.Button(buttons,text="Post Return / Credit Note",command=save_return,bg=NAVY,fg="white",border=0,padx=16,pady=7).pack(side="left",padx=4)
-        tk.Button(buttons,text="Cancel",command=window.destroy,bg="#5f6b76",fg="white",border=0,padx=16,pady=7).pack(side="left",padx=4)
-
     def attach_to_selected_invoice(self):
         invoice_id=self.selected_invoice_id()
         if invoice_id is None: return
@@ -1228,7 +1089,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         try: items=self.client.attachments(invoice_id)
         except Exception as exc: return messagebox.showerror("Attachments",str(exc))
         if not items: return messagebox.showinfo("Attachments","This invoice has no attachments")
-        window=tk.Toplevel(self); window.title("Invoice Attachments"); self.fit_dialog(window,620,340)
+        window=tk.Toplevel(self); window.title("Invoice Attachments"); window.geometry("620x340")
         tree=ttk.Treeview(window,columns=("name","type","size","date"),show="headings")
         for key,label,width in (("name","File Name",240),("type","Type",140),("size","Size",80),("date","Uploaded",140)):
             tree.heading(key,text=label); tree.column(key,width=width)
@@ -1250,7 +1111,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         if invoice_id is None: return
         try: items=self.client.invoice_history(invoice_id)
         except Exception as exc: return messagebox.showerror("History",str(exc))
-        window=tk.Toplevel(self); window.title("Invoice Modification History"); self.fit_dialog(window,760,380)
+        window=tk.Toplevel(self); window.title("Invoice Modification History"); window.geometry("760x380")
         tree=ttk.Treeview(window,columns=("date","user","action","details"),show="headings")
         for key,label,width in (("date","Date",170),("user","User",100),("action","Action",100),("details","Details",370)):
             tree.heading(key,text=label); tree.column(key,width=width)
@@ -1297,8 +1158,6 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
 
     def add_invoice_row(self):
         window=tk.Toplevel(self); window.title("Add Invoice Row"); window.configure(bg=LIGHT); window.transient(self); window.grab_set()
-        self.fit_dialog(window,820,620,480,360)
-        outer,form=self.scrollable_page(window); outer.pack(fill="both",expand=True)
         defaults={"invoice_number":"","invoice_date":datetime.now().strftime("%d-%m-%Y"),"party_name":"",
                   "kind":"purchases","currency":"USD","deductible_subtotal":"0","non_deductible_subtotal":"0","vat":"0","total":"0",
                   "supplier_account":"4011","vat_account":"442660000","expense_account":"601100000",
@@ -1311,14 +1170,14 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
                 ("Due Date (DD-MM-YYYY)","due_date"),("Payment Method","payment_method"),("Paid Amount","amount_paid")]
         for index,(label,key) in enumerate(fields):
             rr=index//2; cc=(index%2)*2
-            tk.Label(form,text=label,bg=LIGHT).grid(row=rr,column=cc,sticky="w",padx=(14,5),pady=7)
-            if key=="kind": widget=ttk.Combobox(form,textvariable=variables[key],values=["assets","expenses","purchases","sales"],state="readonly",width=24)
-            elif key=="currency": widget=ttk.Combobox(form,textvariable=variables[key],values=self.currency_codes,state="readonly",width=24)
-            elif key=="payment_method": widget=ttk.Combobox(form,textvariable=variables[key],values=["Cash","Bank Transfer","Cheque","Card","Other"],state="readonly",width=24)
-            elif key=="branch": widget=self.branch_selector(form,variables[key],24,False)
-            elif key in ("supplier_account","vat_account","expense_account","expense_no_vat_account"): widget=self.account_search_box(form,variables[key],24)
-            elif key in ("invoice_date","due_date"): widget=self.date_entry(form,variables[key],27)
-            else: widget=tk.Entry(form,textvariable=variables[key],width=27)
+            tk.Label(window,text=label,bg=LIGHT).grid(row=rr,column=cc,sticky="w",padx=(14,5),pady=7)
+            if key=="kind": widget=ttk.Combobox(window,textvariable=variables[key],values=["assets","expenses","purchases","sales"],state="readonly",width=24)
+            elif key=="currency": widget=ttk.Combobox(window,textvariable=variables[key],values=self.currency_codes,state="readonly",width=24)
+            elif key=="payment_method": widget=ttk.Combobox(window,textvariable=variables[key],values=["Cash","Bank Transfer","Cheque","Card","Other"],state="readonly",width=24)
+            elif key=="branch": widget=self.branch_selector(window,variables[key],24,False)
+            elif key in ("supplier_account","vat_account","expense_account","expense_no_vat_account"): widget=self.account_search_box(window,variables[key],24)
+            elif key in ("invoice_date","due_date"): widget=self.date_entry(window,variables[key],27)
+            else: widget=tk.Entry(window,textvariable=variables[key],width=27)
             widget.grid(row=rr,column=cc+1,padx=(5,14),pady=7)
         def save():
             values={key:var.get().strip() for key,var in variables.items()}
@@ -1336,12 +1195,12 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
             except Exception as exc: return messagebox.showerror("Invoices",str(exc),parent=window)
             window.destroy(); self.load_invoices(); self.load_dashboard(); self.load_journal(); self.load_trial(); self.load_statement_parties()
             messagebox.showinfo("Invoices","Invoice row added successfully")
-        tk.Button(form,text="Save Invoice",command=save,bg=GOLD,fg=NAVY,font=("Segoe UI",10,"bold"),border=0,padx=24,pady=8).grid(row=9,column=0,columnspan=4,pady=16)
+        tk.Button(window,text="Save Invoice",command=save,bg=GOLD,fg=NAVY,font=("Segoe UI",10,"bold"),border=0,padx=24,pady=8).grid(row=9,column=0,columnspan=4,pady=16)
 
     def add_item_to_selected_invoice(self):
         selected=self.invoice_tree.selection()
         if not selected: return messagebox.showwarning("Invoices","Select one invoice row")
-        invoice_id=int(selected[0]); window=tk.Toplevel(self); window.title("Add Item to Invoice"); window.configure(bg=LIGHT); window.transient(self); window.grab_set(); self.fit_dialog(window,520,420,360,300)
+        invoice_id=int(selected[0]); window=tk.Toplevel(self); window.title("Add Item to Invoice"); window.configure(bg=LIGHT); window.transient(self); window.grab_set()
         defaults={"description":"","quantity":"1","unit_price":"0","subtotal":"0","vat_rate":"11","vat":"0"}
         variables={key:tk.StringVar(value=value) for key,value in defaults.items()}
         fields=[("Description","description"),("Quantity","quantity"),("Unit Price","unit_price"),
@@ -2003,28 +1862,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         self.suggest_party_prefix()
 
     def save_party(self):
-        item={"id":self.edit_party_id,"name":self.party_name.get(),"account_category":self.party_kind.get(),"account_number":self.party_account_number.get(),
-              "tax_number":self.party_tax.get(),"mof_number":self.party_mof.get(),"address":self.party_address.get(),"contact_number":self.party_contact.get(),
-              "currency":self.party_currency.get(),"due_days":self.party_due_days.get()}
-        try:
-            matches=similar_parties(item["name"],self.client.parties(),exclude_id=self.edit_party_id) if item["name"].strip() else []
-        except Exception as exc:
-            return messagebox.showerror("Customers / Suppliers",str(exc))
-        if matches:
-            kind="customer" if item["account_category"] in ("client","customer") else "both" if item["account_category"]=="both" else "supplier"
-            duplicate=next((match for match in matches if match["exact"] and match["kind"]==kind),None)
-            if duplicate:
-                return messagebox.showwarning("Customer / Supplier Already Exists",
-                    f'{duplicate["name"]} already exists with account {duplicate["account_number"] or "(none)"}.\n'
-                    "Select that record and use Edit Selected instead of creating a new one.")
-            lines=[f'{match["name"]} — {match["kind"]} — account {match["account_number"] or "(none)"} '
-                   f'({match["similarity"]:.0%} match)' for match in matches[:5]]
-            extra=f"\n...and {len(matches)-5} more" if len(matches)>5 else ""
-            if not messagebox.askyesno("Similar Customer / Supplier Name",
-                    "A similar name already exists:\n\n"+"\n".join(lines)+extra+
-                    "\n\nReview the existing record first. Save as a separate customer / supplier anyway?"):
-                return
-        try: saved=self.client.save_party(item)
+        try: saved=self.client.save_party({"id":self.edit_party_id,"name":self.party_name.get(),"account_category":self.party_kind.get(),"account_number":self.party_account_number.get(),"tax_number":self.party_tax.get(),"mof_number":self.party_mof.get(),"address":self.party_address.get(),"contact_number":self.party_contact.get(),"currency":self.party_currency.get(),"due_days":self.party_due_days.get()})
         except Exception as exc: return messagebox.showerror("Customers / Suppliers",str(exc))
         self.edit_party_id=saved.get("id"); self.party_account_number.set(saved.get("account_number") or ""); self.load_parties_page(); self.load_statement_parties()
         messagebox.showinfo("Customers / Suppliers",f'Saved successfully\nAutomatic Account Number: {saved.get("account_number") or ""}')
@@ -2059,7 +1897,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         selected=self.parties_tree.selection()
         if not selected: return messagebox.showwarning("Legal Documents","Select a customer or supplier first")
         party_id=int(self.parties_tree.item(selected[0],"values")[0]); party_name=self.parties_tree.item(selected[0],"values")[2]
-        window=tk.Toplevel(self); window.title(f"Legal Documents - {party_name}"); window.configure(bg=LIGHT); self.fit_dialog(window,980,500); window.transient(self)
+        window=tk.Toplevel(self); window.title(f"Legal Documents - {party_name}"); window.configure(bg=LIGHT); window.geometry("980x500"); window.transient(self)
         controls=tk.Frame(window,bg=LIGHT); controls.pack(fill="x",padx=8,pady=(8,2))
         doc_type=tk.StringVar(value="MOF / VAT Certificate"); issue=tk.StringVar(); expiry=tk.StringVar(); notes=tk.StringVar(); active=tk.BooleanVar(value=True)
         editing={"id":None}; pending_file={"path":None}
@@ -2139,14 +1977,24 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
 
     def build_payroll(self):
         nested=ttk.Notebook(self.payroll_tab); nested.pack(fill="both",expand=True,padx=8,pady=8); self.payroll_notebook=nested
-        employees=tk.Frame(nested,bg=LIGHT); run=tk.Frame(nested,bg=LIGHT); settings_outer,settings_page=self.scrollable_page(nested); reports_page=tk.Frame(nested,bg=LIGHT); forms_page=tk.Frame(nested,bg=LIGHT)
+        employees=tk.Frame(nested,bg=LIGHT); run=tk.Frame(nested,bg=LIGHT); settings_outer,settings_page=self.scrollable_page(nested); reports_page=tk.Frame(nested,bg=LIGHT)
         self.payroll_employees_page=employees
-        self.cnss_forms_page=forms_page
-        nested.add(employees,text="Employees"); nested.add(run,text="Payroll Entry"); nested.add(reports_page,text="Payroll Reports & Worksheets (R5 / R6 / R10)"); nested.add(forms_page,text="CNSS Forms"); nested.add(settings_outer,text="Tax & NSSF Settings")
+        nested.add(employees,text="Employees"); nested.add(run,text="Payroll Entry"); nested.add(reports_page,text="Official Reports (R5 / R6 / R10)"); nested.add(settings_outer,text="Tax & NSSF Settings")
         employee_actions=tk.Frame(employees,bg=LIGHT); employee_actions.pack(fill="x",padx=10,pady=8)
         self.action_button(employee_actions,"New Employee",lambda:self.employee_dialog()).pack(side="left",padx=4)
         self.action_button(employee_actions,"Edit Selected",self.edit_selected_employee).pack(side="left",padx=4)
-        self.action_button(employee_actions,"CNSS Employee Forms",lambda:self.open_cnss_form("cnss_r3", self._selected_employee_id())).pack(side="left",padx=4)
+        self.action_button(employee_actions,"R3 Registration Worksheet",lambda:self.employee_r3_worksheet("preview")).pack(side="left",padx=4)
+        self.action_button(employee_actions,"R3 PDF",lambda:self.employee_r3_worksheet("pdf")).pack(side="left",padx=4)
+        self.action_button(employee_actions,"R3 Excel",lambda:self.employee_r3_worksheet("xlsx")).pack(side="left",padx=4)
+        self.action_button(employee_actions,"Official R3 Form",lambda:self.download_payroll_form("R3")).pack(side="left",padx=4)
+        self.action_button(employee_actions,"Official R3-1 Form",lambda:self.download_payroll_form("R3-1")).pack(side="left",padx=4)
+        nssf_forms=tk.Frame(employees,bg=LIGHT); nssf_forms.pack(fill="x",padx=10,pady=(0,5))
+        tk.Label(nssf_forms,text="NSSF employee forms:",bg=LIGHT,fg=NAVY,font=("Segoe UI",9,"bold")).pack(side="left",padx=4)
+        self.action_button(nssf_forms,"Employment Declaration Worksheet",lambda:self.employee_nssf_declaration("hire","preview")).pack(side="left",padx=4)
+        self.action_button(nssf_forms,"Termination Declaration Worksheet",lambda:self.employee_nssf_declaration("leave","preview")).pack(side="left",padx=4)
+        self.action_button(nssf_forms,"New Employee Registration",lambda:self.download_payroll_form("NSSF-HIRE-NEW")).pack(side="left",padx=4)
+        self.action_button(nssf_forms,"Hire Existing NSSF Member",lambda:self.download_payroll_form("NSSF-HIRE-EXISTING")).pack(side="left",padx=4)
+        self.action_button(nssf_forms,"Employee Leaving",lambda:self.download_payroll_form("NSSF-LEAVE")).pack(side="left",padx=4)
         self.action_button(employee_actions,"Refresh",self.load_payroll).pack(side="left",padx=4)
         self.employee_tree=self.table(employees,[("number","Employee ID",105),("name","Employee Name",220),("job","Job Title",150),
             ("start","Starting Date",110),("leaving","Leaving Date",110),("branch","Branch",120),("currency","Currency",70),
@@ -2207,25 +2055,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         self.action_button(settings_page,"Save Settings",self.save_payroll_settings).grid(row=12,column=1,padx=10,pady=10)
         tk.Button(settings_page,text="Load Lebanese Law 2024-2026",command=self.apply_lebanese_payroll_rules,bg=GOLD,fg=NAVY,border=0,padx=14,pady=7,font=("Segoe UI",9,"bold")).grid(row=12,column=2,columnspan=2,padx=10,pady=10)
         self.build_payroll_periods_panel(settings_page,13)
-        import lebanese_payroll
-        family_reference=tk.LabelFrame(settings_page,text="Family allowance reference · 2024–2026 (monthly LBP)",bg=LIGHT,padx=8,pady=6)
-        family_reference.grid(row=14,column=0,columnspan=6,padx=10,pady=8,sticky="ew")
-        columns=("from","to","spouse","child","maximum")
-        family_table=ttk.Treeview(family_reference,columns=columns,show="headings",height=3)
-        for key,label,width in (("from","Effective from",120),("to","Through",120),("spouse","Spouse",130),
-                                 ("child","Per child (up to 5)",165),("maximum","Monthly maximum",165)):
-            family_table.heading(key,text=label)
-            family_table.column(key,width=width,anchor="center" if key in ("from","to") else "e",stretch=True)
-        for start,end,spouse,child,maximum in lebanese_payroll.FAMILY_ALLOWANCE_PERIODS:
-            family_table.insert("", "end",values=(safe_display_date(start),safe_display_date(end) if end else "Open",
-                f"{int(spouse):,}",f"{int(child):,}",f"{int(maximum):,}"))
-        family_table.pack(fill="x")
-        tk.Label(family_reference,text="Reference amounts only. Load Lebanese Law to apply them to this company-year; edit the period table above to customize. "
-            "2024: Decrees 12599/12772 · 2025: Decree 422 / CNSS memo 793 · 2026: Decree 2923 / CNSS memo 831.",
-            bg=LIGHT,fg="#5f6b76",anchor="w",justify="left",wraplength=950).pack(fill="x",pady=(4,0))
-        tk.Label(settings_page,text="Salary-tax policy used here: no spouse deduction when the spouse works; half the child deduction. Confirm this dependent split with your accountant. Tax applies only above the taxable threshold.",
-            bg=LIGHT,fg="#5f6b76",anchor="w",justify="left",wraplength=950).grid(row=15,column=0,columnspan=6,padx=10,pady=4,sticky="w")
-        mapping_frame=tk.LabelFrame(settings_page,text="Standard Posting Accounts",bg=LIGHT,padx=8,pady=6); mapping_frame.grid(row=16,column=0,columnspan=6,padx=10,pady=8,sticky="ew")
+        mapping_frame=tk.LabelFrame(settings_page,text="Standard Posting Accounts",bg=LIGHT,padx=8,pady=6); mapping_frame.grid(row=14,column=0,columnspan=6,padx=10,pady=8,sticky="ew")
         self.payroll_employee_accounts={key:tk.StringVar() for key in ("salary","transport","overtime","commission","retro_salary","schooling","bonus","thirteenth_month","director_remuneration","family_allowance","tax","nssf","payable")}
         self.payroll_manager_accounts={key:tk.StringVar() for key in self.payroll_employee_accounts}
         tk.Label(mapping_frame,text="Component",bg=LIGHT,font=("Segoe UI",9,"bold")).grid(row=0,column=0,padx=5); tk.Label(mapping_frame,text="Employees",bg=LIGHT,font=("Segoe UI",9,"bold")).grid(row=0,column=1,padx=5); tk.Label(mapping_frame,text="Managers",bg=LIGHT,font=("Segoe UI",9,"bold")).grid(row=0,column=2,padx=5)
@@ -2235,13 +2065,12 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
             self.account_search_box(mapping_frame,self.payroll_employee_accounts[key],16).grid(row=index,column=1,padx=5,pady=2)
             self.account_search_box(mapping_frame,self.payroll_manager_accounts[key],16).grid(row=index,column=2,padx=5,pady=2)
         self.build_payroll_reports_page(reports_page)
-        self.build_cnss_forms_page(forms_page)
         self.load_payroll()
         self.load_payroll_settings()
 
     def employee_dialog(self,employee=None):
         window=tk.Toplevel(self); window.title("Employee File"); window.configure(bg=LIGHT); window.transient(self); window.grab_set()
-        self.fit_dialog(window,940,650,480,360)
+        window.geometry(f"{min(940,self.winfo_screenwidth())}x{min(650,self.winfo_screenheight()-80)}")
         outer,form=self.scrollable_page(window); outer.pack(fill="both",expand=True)
         data=employee or {}; fields={key:tk.StringVar(value=str(data.get(key) or "")) for key in ("employee_number","full_name","national_id","mof_number","nssf_number","address","contact_number","nationality","father_name","mother_name","birth_date","birth_place","job_title","hire_date","leave_date","base_salary","salary_account","payable_account")}
         if not fields["employee_number"].get(): fields["employee_number"].set("1000")
@@ -2330,14 +2159,32 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
             f'NSSF_{kind}_Worksheet_{employee["employee_number"]}',format_name)
 
     def download_payroll_form(self,form):
-        selected=self.employee_tree.selection() if hasattr(self,"employee_tree") else ()
-        self.open_cnss_form(form,selected[0] if selected else None)
+        official={"R3":"https://eservices.finance.gov.lb/Resources/Namazej/DASS1/%D8%B13.pdf",
+                  "R3-1":"https://www.finance.gov.lb/en-us/Taxation/Na/DASS1/%D8%B13-1.pdf",
+                  "NSSF-DUE":"https://drive.google.com/uc?export=download&id=1ZwZR6kFj19KPbtALttm8U6Ji3ICJUjGB",
+                  "NSSF-SETTLEMENT":"https://drive.google.com/uc?export=download&id=14eHUtHDblW9mE_4Vs82PmRrmbMGGSEKg",
+                  "NSSF-ANNUAL":"https://drive.google.com/uc?export=download&id=1TNwLlioahMJLaiX3ma6PPYqrgbHm07f_",
+                  "NSSF-HIRE-NEW":"https://drive.google.com/uc?export=download&id=1FHWgIuJm38oLcypxT6lMXlTlY9eCXDpe",
+                  "NSSF-HIRE-EXISTING":"https://drive.google.com/uc?export=download&id=1jK1Nv4RgzslncCsV-5gc7e2rHYZQThyq",
+                  "NSSF-LEAVE":"https://drive.google.com/uc?export=download&id=1_stgCRJwJjdqr2kFLy07ZCwiXDkMdZIy"}
+        if form not in official: raise ValueError("Unknown payroll form")
+        agency="CNSS" if form.startswith("NSSF") else "MOF"
+        target=filedialog.asksaveasfilename(title=f"Save official {form} form",defaultextension=".pdf",
+            initialfile=f"Lebanon_{agency}_{form}.pdf",filetypes=[("PDF files","*.pdf")])
+        if not target: return
+        try:
+            with urlopen(official[form],timeout=20) as response: content=response.read()
+            if not content.startswith(b"%PDF"): raise ValueError(f"The {agency} form link did not return a PDF")
+            Path(target).write_bytes(content)
+        except Exception as exc: return messagebox.showerror(f"Official {form}",f"Could not download the form: {exc}")
+        note=("\nCheck the preprinted rates against the period's NSSF settings before using this blank form."
+              if form in ("NSSF-DUE","NSSF-SETTLEMENT","NSSF-ANNUAL") else "")
+        messagebox.showinfo(f"Official {form}",f"Official blank form saved to {target}{note}")
 
     def load_payroll(self):
         if not hasattr(self,"employee_tree"): return
         try: self.employee_rows=self.client.employees(); payroll=self.client.payroll()
         except Exception as exc: return messagebox.showerror("Payroll",str(exc))
-        if hasattr(self,"cnss_employee_combo"): self.refresh_cnss_employee_options()
         self.employee_tree.delete(*self.employee_tree.get_children())
         for row in self.employee_rows: self.employee_tree.insert("","end",iid=str(row["id"]),values=(row["employee_number"],row["full_name"],row["job_title"],safe_display_date(row.get("hire_date")),safe_display_date(row.get("leave_date")),row.get("branch_name") or "",row["currency"],row["base_salary"],row["nssf_number"],"Yes" if row["active"] else "No"))
         self.payroll_employee_map={f'{row["employee_number"]} - {row["full_name"]}':row for row in self.employee_rows if row["active"]}
@@ -2437,12 +2284,10 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         self.payroll_brackets.delete("1.0","end"); self.payroll_brackets.insert("1.0",json.dumps(settings.get("tax_brackets",[])))
 
     def apply_lebanese_payroll_rules(self):
-        if not messagebox.askyesno("Lebanese Payroll Rules","Replace ALL Tax & NSSF periods with the configured Lebanese payroll rules from 01-01-2024?\n\n"
+        if not messagebox.askyesno("Lebanese Payroll Rules","Replace ALL Tax & NSSF periods with the official Lebanese rules from 01-01-2024?\n\n"
             "- Budget Law 2024 brackets and family deductions\n- Transport exempt 450,000 LBP/day, schooling 6M/year\n- Tax rounded up to 10,000 LBP from 25-11-2024\n"
-            "- NSSF sickness & maternity ceiling: 45M -> 90M (04-2024) -> 140M (08-2025); family 12M -> 18M (07-2025) -> 28M (05-2026)\n"
-            "- Family benefits: 600k/330k from 01-2024, 1.2M/660k from 07-2025, 2.1M/1.155M from 05-2026 (spouse/child)\n\n"
-            "Rates, employee eligibility, and any part-month minimum-wage treatment must be confirmed with CNSS / your accountant. "
-            "These reports are preparation worksheets, not official filings. Posting accounts are kept. Already saved payroll is NOT recalculated."): return
+            "- NSSF ceilings: 45M -> 90M (04-2024) -> 120M (08-2025); family 12M -> 18M (07-2025) -> 28M (05-2026)\n- NSSF family allowances from 05-2026 (Decree 2923)\n\n"
+            "Employer sickness & maternity is set to 8% (check with your accountant). Posting accounts are kept. Already saved payroll is NOT recalculated."): return
         try: self.client.apply_lebanese_payroll_rules()
         except Exception as exc: return messagebox.showerror("Lebanese Payroll Rules",str(exc))
         self.load_payroll_periods(); self.load_payroll_settings(); messagebox.showinfo("Lebanese Payroll Rules","Lebanese payroll rules loaded. Recalculate draft payroll to apply them.")
@@ -2653,7 +2498,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
             rows.append(["","TOTAL",round(sum(r[2] for r in rows),2),round(sum(r[3] for r in rows),2),""])
             sections.append({"heading":f"CLOSING 6&7 - {year} ({currency})   Net result: {info['net_result']:,.2f} {'profit' if info['net_result']>=0 else 'loss'}",
                 "headers":["Account","Account Name",f"Debit ({currency})",f"Credit ({currency})","LBP"],"rows":rows,"total_rows":[len(rows)-1]})
-        window=tk.Toplevel(self); window.title(f"Preview closing {year}"); self.fit_dialog(window,900,480); window.configure(bg=LIGHT); window.transient(self)
+        window=tk.Toplevel(self); window.title(f"Preview closing {year}"); window.geometry("900x480"); window.configure(bg=LIGHT); window.transient(self)
         viewer=self.report_viewer(window); self.show_sections(viewer,sections)
         self.action_button(window,"Close",window.destroy).pack(pady=6)
 
@@ -2998,7 +2843,6 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         try: account=self.client.save_account({"code":self.new_account_code.get(),"name_en":self.new_account_name.get(),"parent_code":self.new_account_parent.get(),"type":self.new_account_type.get()})
         except Exception as exc: return messagebox.showerror("Chart of Accounts",str(exc))
         self._account_cache=None
-        if hasattr(self,"_all_accounts"): self._all_accounts[account["code"]]=account["name_en"]
         self.new_account_code.set(""); self.new_account_name.set(""); self.new_account_parent.set(""); self.load_accounts()
         messagebox.showinfo("Chart of Accounts",f'Account {account["code"]} created successfully')
 
@@ -3027,7 +2871,6 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
             rows=self.client.accounts()
         except Exception as exc:
             return messagebox.showerror("Error",str(exc))
-        self._all_accounts={str(row["code"]):row["name_en"] for row in rows}
         self.accounts_tree.delete(*self.accounts_tree.get_children())
         for row in rows:
             self.accounts_tree.insert("","end",values=(row["code"],row.get("parent_code") or "",
@@ -3038,19 +2881,16 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         users=tk.Frame(nested,bg=LIGHT); backups=tk.Frame(nested,bg=LIGHT); rates=tk.Frame(nested,bg=LIGHT); branches=tk.Frame(nested,bg=LIGHT); general=tk.Frame(nested,bg=LIGHT)
         is_admin=(self.current_user or {}).get("role")=="admin"
         if is_admin: nested.add(users,text="Users & Permissions")
-        is_viewer=(self.current_user or {}).get("role")=="viewer"
-        if not is_viewer: nested.add(backups,text="Backup & Restore" if is_admin else "My Backups")
-        nested.add(rates,text="Exchange Rates"); nested.add(branches,text="Branches"); nested.add(general,text="General Settings"); self.build_dimensions_pages(nested)
+        nested.add(backups,text="Backup & Restore" if is_admin else "My Backups"); nested.add(rates,text="Exchange Rates"); nested.add(branches,text="Branches"); nested.add(general,text="General Settings"); self.build_dimensions_pages(nested)
         if is_admin: self.build_users_page(users)
-        if not is_viewer:
-            backup_controls=tk.Frame(backups,bg=LIGHT); backup_controls.pack(fill="x",padx=10,pady=10)
-            self.backup_scope=tk.Label(backups,text="",bg=LIGHT,fg=NAVY,font=("Segoe UI",10,"bold"),anchor="w"); self.backup_scope.pack(fill="x",padx=14,before=backup_controls)
-            tk.Button(backup_controls,text="Create Backup Now",command=self.create_backup,bg=GOLD,fg=NAVY,border=0,padx=15,pady=7,font=("Segoe UI",9,"bold")).pack(side="left",padx=4)
-            self.action_button(backup_controls,"Save Backup As... (USB / Drive)",self.save_backup_as).pack(side="left",padx=4)
-            self.action_button(backup_controls,"Open Backup Folder",self.open_backup_folder).pack(side="left",padx=4)
-            if is_admin: tk.Button(backup_controls,text="Restore Selected",command=self.restore_selected_backup,bg="#8B1E1E",fg="white",border=0,padx=15,pady=7).pack(side="left",padx=4)
-            tk.Label(backups,text="Backups are saved by company and fiscal year automatically each day while signed in to Windows. You can also create or export one here.",bg=LIGHT,fg="#5f6b76",wraplength=1050,justify="left").pack(fill="x",padx=14)
-            self.backups_tree=self.table(backups,[("name","Backup File",430),("kind","Type",100),("size","Size",100),("modified","Created",170)])
+        backup_controls=tk.Frame(backups,bg=LIGHT); backup_controls.pack(fill="x",padx=10,pady=10)
+        self.backup_scope=tk.Label(backups,text="",bg=LIGHT,fg=NAVY,font=("Segoe UI",10,"bold"),anchor="w"); self.backup_scope.pack(fill="x",padx=14,before=backup_controls)
+        tk.Button(backup_controls,text="Create Backup Now",command=self.create_backup,bg=GOLD,fg=NAVY,border=0,padx=15,pady=7,font=("Segoe UI",9,"bold")).pack(side="left",padx=4)
+        self.action_button(backup_controls,"Save Backup As... (USB / Drive)",self.save_backup_as).pack(side="left",padx=4)
+        self.action_button(backup_controls,"Open Backup Folder",self.open_backup_folder).pack(side="left",padx=4)
+        if is_admin: tk.Button(backup_controls,text="Restore Selected",command=self.restore_selected_backup,bg="#8B1E1E",fg="white",border=0,padx=15,pady=7).pack(side="left",padx=4)
+        tk.Label(backups,text="Backups are saved by company and fiscal year automatically each day while signed in to Windows. You can also create or export one here.",bg=LIGHT,fg="#5f6b76",wraplength=1050,justify="left").pack(fill="x",padx=14)
+        self.backups_tree=self.table(backups,[("name","Backup File",430),("kind","Type",100),("size","Size",100),("modified","Created",170)])
         rate_controls=tk.Frame(rates,bg=LIGHT); rate_controls.pack(fill="x",padx=10,pady=10)
         self.rate_date=tk.StringVar(value=datetime.now().strftime("%d-%m-%Y")); self.rate_date_to=tk.StringVar(value=datetime.now().strftime("%d-%m-%Y")); self.rate_from=tk.StringVar(value="USD"); self.rate_to=tk.StringVar(value="LBP"); self.rate_value=tk.StringVar(value="1")
         tk.Label(rate_controls,text="Date From",bg=LIGHT).pack(side="left"); self.date_entry(rate_controls,self.rate_date,12).pack(side="left",padx=4)
@@ -3093,7 +2933,7 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         self.load_settings_pages()
 
     def load_settings_pages(self):
-        if not hasattr(self,"rates_tree"): return
+        if not hasattr(self,"backups_tree"): return
         try:
             settings=self.client.settings(); rates=self.client.exchange_rates()
             self.base_currency.set(settings.get("base_currency","USD")); self.backup_hours.set(settings.get("backup_interval_hours","24"))
@@ -3106,17 +2946,14 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         except Exception: branch_rows=[]
         self.branches_tree.delete(*self.branches_tree.get_children())
         for row in branch_rows: self.branches_tree.insert("","end",values=(row["id"],row["name"],"Yes" if row["active"] else "No"))
-        backups=[]
-        if hasattr(self,"backups_tree"):
-            try: backups=self.client.backups()
-            except Exception: backups=[]
-            self.backups_tree.delete(*self.backups_tree.get_children())
+        try: backups=self.client.backups()
+        except Exception: backups=[]
+        self.backups_tree.delete(*self.backups_tree.get_children())
         if (self.current_user or {}).get("role")=="admin":
             try: users=self.client.users()
             except Exception: users=[]
             self.users_tree.delete(*self.users_tree.get_children()); self.fill_users_tree(users)
-        if hasattr(self,"backups_tree"):
-            for row in backups: self.backups_tree.insert("","end",iid=row["name"],values=(row["name"],row.get("kind","backup"),f'{row["size"]/1024/1024:,.2f} MB',row["modified"][:19].replace("T"," ")))
+        for row in backups: self.backups_tree.insert("","end",iid=row["name"],values=(row["name"],row.get("kind","backup"),f'{row["size"]/1024/1024:,.2f} MB',row["modified"][:19].replace("T"," ")))
         if hasattr(self,"backup_scope"): self.backup_scope.config(text=f'Backups of {getattr(self,"current_company",{}).get("name","")} - fiscal year {getattr(self,"current_fiscal_year","")}')
 
     def save_branch(self):
@@ -3209,49 +3046,21 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
     def action_button(self,parent,text,command):
         return tk.Button(parent,text=text,command=command,bg=NAVY,fg="white",border=0,padx=15,pady=7)
 
-    def account_search_box(self,parent,variable,width=22,replace_on_focus=False):
+    def account_search_box(self,parent,variable,width=22):
         try: accounts=self.client.accounts() if self.client else []
         except Exception: accounts=[]
-        accounts=[row for row in accounts if len(str(row.get("code") or ""))>=3 and str(row.get("code") or "").isdigit()]
+        accounts=[row for row in accounts if len(str(row.get("code") or ""))==9 and str(row.get("code") or "").isdigit()]
         choices=[f'{row["code"]} - {row["name_en"]}' for row in accounts]
         box=ttk.Combobox(parent,textvariable=variable,values=choices,width=width)
-        def matches(value):
-            return [row for row in accounts if row_matches_search((row["code"],row["name_en"],row.get("name_ar"),row.get("name_fr")),value)]
-        def search(event=None):
-            if event and event.keysym in ("Tab","Return","Escape","Up","Down"): return
-            typed=variable.get().strip()
-            box["values"]=[f'{row["code"]} - {row["name_en"]}' for row in matches(typed)] if typed else choices
-        def choose(event=None):
-            value=variable.get().strip(); code=value.split(" - ",1)[0].strip()
-            if not value: return
-            if code.isdigit() and (code in {str(row["code"]) for row in accounts} or " - " in value):
-                variable.set(code)
-            elif code.isdigit():
-                variable.set(code)  # allow an existing legacy code absent from the current chart
-            else:
-                found=matches(value)
-                if len(found)==1: variable.set(str(found[0]["code"]))
-                elif event and event.keysym in ("Tab","Return"):
-                    box.bell(); return "break"
-            if event and event.keysym=="Return":
-                box.tk_focusNext().focus_set(); return "break"
-        def refresh(_event=None):
-            try: fresh=self.client.accounts()
-            except Exception: fresh=[]
-            if fresh:
-                accounts[:]=[row for row in fresh if len(str(row.get("code") or ""))>=3 and str(row.get("code") or "").isdigit()]
-                choices[:]=[f'{row["code"]} - {row["name_en"]}' for row in accounts]
-            search()
-            self.active_account_variable=variable
-            if replace_on_focus:
-                box.after_idle(lambda: box.select_range(0,"end") if box.winfo_exists() and box.focus_get()==box else None)
-        box.bind("<KeyRelease>",search); box.bind("<<ComboboxSelected>>",choose)
-        box.bind("<FocusOut>",choose); box.bind("<Return>",choose); box.bind("<Tab>",choose)
-        if not replace_on_focus:
-            box.bind("<Button-1>",lambda _event: box.after_idle(lambda: box.event_generate("<Down>")))
-        box.bind("<FocusIn>",refresh)
-        box._f2=lambda: self.open_account_lookup(variable,include_groups=True)
-        box.bind("<F2>",lambda _event: (box._f2(),"break")[1])
+        def search(_event=None):
+            typed=variable.get().strip().casefold()
+            box["values"]=[value for value in choices if typed in value.casefold()] if typed else choices
+            if typed and box["values"]: box.after_idle(lambda: box.event_generate("<Down>"))
+        def choose(_event=None):
+            value=variable.get(); variable.set(value.split(" - ",1)[0].strip() if " - " in value else value.strip())
+        box.bind("<KeyRelease>",search); box.bind("<<ComboboxSelected>>",choose); box.bind("<FocusOut>",choose)
+        box.bind("<Button-1>",lambda _event: box.after_idle(lambda: box.event_generate("<Down>")))
+        box.bind("<FocusIn>",lambda _event:setattr(self,"active_account_variable",variable))
         box._account_var=variable  # right-click opens the account search for this field
         return box
 
@@ -3259,95 +3068,28 @@ class SaberApp(V22Mixin, InventoryMixin, Stage3Mixin, DimensionsMixin, BrainsScr
         if self.active_account_variable is not None: self.open_account_lookup(self.active_account_variable)
         return "break"
 
-    def create_account_in_lookup(self, parent_code, name, account_type, variable):
-        parent_code=str(parent_code or "").split(" - ",1)[0].strip()
-        name=str(name or "").strip()
-        if len(parent_code)!=4 or not parent_code.isdigit():
-            raise ValueError("Choose a 4-digit parent account before creating a new account")
-        if not name:
-            raise ValueError("Enter a name for the new account")
-        if account_type not in ("asset","liability","equity","income","expense"):
-            raise ValueError("Choose the new account type")
-        account=self.client.save_account({"code":"","parent_code":parent_code,"name_en":name,"type":account_type})
-        self._account_cache=None
-        if hasattr(self,"_all_accounts"): self._all_accounts[account["code"]]=account["name_en"]
-        variable.set(account["code"])
-        if hasattr(self,"accounts_tree"): self.load_accounts()
-        return account
-
-    def open_account_lookup(self,variable,include_groups=False):
-        try: all_accounts=self.client.accounts()
+    def open_account_lookup(self,variable):
+        try: accounts=self.client.accounts()
         except Exception as exc: return messagebox.showerror("Account Search",str(exc))
-        accounts=[row for row in all_accounts if str(row.get("code") or "").isdigit() and len(str(row["code"])) >= (3 if include_groups else 9)]
-        parents={str(row["code"]):row for row in all_accounts if len(str(row.get("code") or ""))==4 and str(row["code"]).isdigit()}
-        previous_grab=self.grab_current()
-        window=tk.Toplevel(self); window.title("Find or Create Account - F2")
-        fit_dialog=getattr(self,"fit_dialog",None)
-        if fit_dialog: fit_dialog(window,820,590,320,320)
-        else: SaberApp.fit_dialog(self,window,820,590,320,320)
-        window.configure(bg=LIGHT); window.transient(previous_grab or self); window.grab_set()
-        def close_lookup():
-            window.destroy()
-            if previous_grab is not None and previous_grab.winfo_exists(): previous_grab.grab_set()
-        window.protocol("WM_DELETE_WINDOW",close_lookup)
-        window.bind("<Escape>",lambda _event:close_lookup())
-        search_var=tk.StringVar(value=variable.get().split(" - ",1)[0].strip()); top=tk.Frame(window,bg=LIGHT); top.pack(fill="x",padx=10,pady=10)
-        tk.Label(top,text="Find by number or name (English / Arabic / French):",bg=LIGHT,font=("Segoe UI",10,"bold")).pack(side="left")
-        entry=tk.Entry(top,textvariable=search_var,width=38); entry.pack(side="left",padx=8); entry.focus_set(); entry.select_range(0,"end")
+        accounts=[row for row in accounts if len(str(row.get("code") or ""))==9 and str(row.get("code") or "").isdigit()]
+        window=tk.Toplevel(self); window.title("Account Search - F2"); window.geometry("700x500"); window.configure(bg=LIGHT); window.transient(self); window.grab_set()
+        search_var=tk.StringVar(); top=tk.Frame(window,bg=LIGHT); top.pack(fill="x",padx=10,pady=10)
+        tk.Label(top,text="Search by Account Number or Name:",bg=LIGHT,font=("Segoe UI",10,"bold")).pack(side="left")
+        entry=tk.Entry(top,textvariable=search_var,width=42); entry.pack(side="left",padx=8); entry.focus_set()
         frame=tk.Frame(window,bg=LIGHT); frame.pack(fill="both",expand=True,padx=10,pady=(0,10))
-        tree=ttk.Treeview(frame,columns=("code","name","arabic","type"),show="headings")
-        for column,label,width in (("code","Account Number",140),("name","Account Name",300),("arabic","Arabic Name",200),("type","Type",100)):
-            tree.heading(column,text=label); tree.column(column,width=width)
+        tree=ttk.Treeview(frame,columns=("code","name","type"),show="headings"); tree.heading("code",text="Account Number"); tree.heading("name",text="Account Name"); tree.heading("type",text="Type"); tree.column("code",width=150); tree.column("name",width=350); tree.column("type",width=120)
         scroll=ttk.Scrollbar(frame,orient="vertical",command=tree.yview); tree.configure(yscrollcommand=scroll.set); tree.pack(side="left",fill="both",expand=True); scroll.pack(side="right",fill="y")
         def populate(*_args):
-            tree.delete(*tree.get_children()); typed=search_var.get().strip()
+            tree.delete(*tree.get_children()); typed=search_var.get().strip().casefold()
             for row in accounts:
-                if row_matches_search((row["code"],row["name_en"],row.get("name_ar"),row.get("name_fr"),row["type"]),typed):
-                    tree.insert("","end",values=(row["code"],row["name_en"],row.get("name_ar") or "",row["type"]))
+                text=f'{row["code"]} {row["name_en"]}'.casefold()
+                if not typed or typed in text: tree.insert("","end",values=(row["code"],row["name_en"],row["type"]))
         def select(_event=None):
             selected=tree.selection()
             if not selected: return
-            values=tree.item(selected[0],"values"); variable.set(str(values[0])); close_lookup()
+            values=tree.item(selected[0],"values"); variable.set(str(values[0])); window.destroy()
         search_var.trace_add("write",populate); tree.bind("<Double-1>",select); tree.bind("<Return>",select); entry.bind("<Return>",lambda _event:(tree.selection_set(tree.get_children()[0]),select()) if tree.get_children() else None)
-        tk.Label(window,text="Double-click an account or press Enter to select. If it does not exist, create it below.",bg=LIGHT,fg="#5f6b76").pack(pady=(0,5))
-        create=tk.LabelFrame(window,text="Create account here (number assigned automatically)",bg=LIGHT,padx=10,pady=8)
-        create.pack(fill="x",padx=10,pady=(0,10))
-        parent_var=tk.StringVar(); name_var=tk.StringVar(); type_var=tk.StringVar()
-        tk.Label(create,text="4-digit parent",bg=LIGHT).grid(row=0,column=0,sticky="w",padx=4)
-        parent_box=ttk.Combobox(create,textvariable=parent_var,values=[f'{code} - {row["name_en"]}' for code,row in parents.items()],width=26)
-        parent_box.grid(row=0,column=1,sticky="ew",padx=4)
-        tk.Label(create,text="New account name",bg=LIGHT).grid(row=0,column=2,sticky="w",padx=4)
-        tk.Entry(create,textvariable=name_var,width=30).grid(row=0,column=3,sticky="ew",padx=4)
-        tk.Label(create,text="Type",bg=LIGHT).grid(row=1,column=0,sticky="w",padx=4,pady=(8,0))
-        ttk.Combobox(create,textvariable=type_var,values=["asset","liability","equity","income","expense"],state="readonly",width=16).grid(row=1,column=1,sticky="w",padx=4,pady=(8,0))
-        number_hint=tk.StringVar(value="Select a parent to assign the next number")
-        tk.Label(create,textvariable=number_hint,bg=LIGHT,fg=NAVY).grid(row=1,column=2,sticky="w",padx=4,pady=(8,0))
-        def preview_parent(_event=None):
-            prefix=parent_var.get().split(" - ",1)[0].strip()
-            if prefix in parents:
-                type_var.set(parents[prefix]["type"])
-                try: number_hint.set(f'Next number: {self.client.next_account_number(prefix)}')
-                except Exception as exc: number_hint.set(str(exc))
-            else: number_hint.set("Choose a listed 4-digit parent")
-        parent_box.bind("<<ComboboxSelected>>",preview_parent); parent_box.bind("<FocusOut>",preview_parent)
-        def create_and_select():
-            prefix=parent_var.get().split(" - ",1)[0].strip()
-            if not prefix:
-                selected=tree.selection()
-                if selected: prefix=str(tree.item(selected[0],"values")[0])[:4]
-            if not prefix:
-                typed=search_var.get().strip()
-                if len(typed)>=4 and typed[:4].isdigit(): prefix=typed[:4]
-            name=name_var.get().strip()
-            if not name and search_var.get().strip() and not any(ch.isdigit() for ch in search_var.get()):
-                name=search_var.get().strip()
-            if prefix in parents and not type_var.get(): type_var.set(parents[prefix]["type"])
-            try: self.create_account_in_lookup(prefix,name,type_var.get(),variable)
-            except Exception as exc: return messagebox.showerror("Create Account",str(exc),parent=window)
-            close_lookup()
-        self.action_button(create,"Create & Select",create_and_select).grid(row=1,column=3,sticky="e",padx=4,pady=(8,0))
-        create.columnconfigure(3,weight=1)
-        populate()
+        tk.Label(window,text="Double-click an account or press Enter to select",bg=LIGHT,fg="#5f6b76").pack(pady=(0,8)); populate()
 
     def branch_selector(self,parent,variable,width=18,include_all=False):
         try: branches=self.client.branches() if self.client else []

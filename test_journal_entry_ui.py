@@ -40,24 +40,6 @@ class JournalEntryUiTest(unittest.TestCase):
         journal.voucher_cell_changed("first", "description", "Updated first")
         self.assertEqual(journal.voucher_sheet.rows["second"]["description"], "Different detail")
 
-    def test_keyboard_moves_into_first_empty_voucher_account(self):
-        journal = BrainsScreensMixin()
-        sheet = FakeSheet()
-        sheet.rows["first"]["account"] = "601100001"
-        sheet.rows["second"]["account"] = ""
-        sheet.tree.selection_set = lambda iid: setattr(sheet.tree, "selection", iid)
-        sheet.tree.focus = lambda iid: setattr(sheet.tree, "focused", iid)
-        sheet.tree.see = lambda iid: None
-        sheet.tree.focus_set = lambda: None
-        sheet.edit = lambda iid, key: setattr(sheet, "edited", (iid, key))
-        journal.voucher_sheet = sheet
-        journal.after = lambda _delay, callback: callback()
-
-        self.assertEqual(journal.focus_voucher_entries(), "break")
-        self.assertEqual(sheet.tree.selection, "second")
-        self.assertEqual(sheet.tree.focused, "second")
-        self.assertEqual(sheet.edited, ("second", "account"))
-
 
 if __name__ == "__main__":
     unittest.main()

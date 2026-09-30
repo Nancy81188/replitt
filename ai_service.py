@@ -60,12 +60,9 @@ def read_invoice_pdf(path, api_key):
     raw = stream.getvalue()
     if len(raw) > 8_000_000: raise ValueError("First PDF page is too large for AI preview")
     encoded = base64.b64encode(raw).decode("ascii")
-    prompt = ('Read only page 1 of this invoice, including scanned pages. Return JSON only with keys '
-              'invoice_number, invoice_date (DD-MM-YYYY), party_name (the supplier or billed customer), '
-              'currency (USD/LBP/EUR/AED), subtotal, vat, total, items. '
-              'Each item must have description, quantity, unit_price and total exactly as printed; '
-              'use an empty array if item rows are unclear. Use null for unclear header amounts; '
-              'do not calculate missing VAT or invent values. One invoice only.')
+    prompt = ('Read only page 1. Return JSON only with keys invoice_number, invoice_date (DD-MM-YYYY), '
+              'party_name (the billed customer or supplier), currency (USD/LBP/EUR/AED), subtotal, vat, total. '
+              'Use null when a field is unclear; do not calculate missing VAT or invent values. One invoice only.')
     result = _respond([{"type": "input_file", "filename": "invoice-page-1.pdf", "file_data": "data:application/pdf;base64," + encoded},
                        {"type": "input_text", "text": prompt}], api_key)
     data = {key: result.get(key) for key in ("invoice_number", "invoice_date", "party_name", "currency", "subtotal", "vat", "total")}
@@ -74,15 +71,4 @@ def read_invoice_pdf(path, api_key):
         if data[key] is not None:
             try: data[key] = float(str(data[key]).replace(",", ""))
             except ValueError: data[key] = None
-    items = []
-    for row in result.get("items") or []:
-        if not isinstance(row, dict) or not str(row.get("description") or "").strip(): continue
-        try:
-            quantity = float(str(row["quantity"]).replace(",", ""))
-            price = float(str(row["unit_price"]).replace(",", ""))
-            total = float(str(row["total"]).replace(",", ""))
-        except (TypeError, ValueError, KeyError): continue
-        if quantity <= 0 or price < 0 or total < 0 or abs(quantity * price - total) > max(.05, total * .03): continue
-        items.append({"description": str(row["description"])[:160], "quantity": quantity, "unit_price": price, "total": total, "unit": "unit"})
-    data["items"] = items[:200]
     return data

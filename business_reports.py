@@ -75,21 +75,18 @@ def ageing(db, options):
     with db.connect() as connection:
         invoices = [dict(r) for r in connection.execute("""SELECT i.id,i.invoice_number,i.invoice_date,i.due_date,i.currency,i.doc_subtype,i.party_id,p.name party_name,p.account_number,p.due_days,
             CAST(i.total AS REAL) total,CAST(COALESCE(i.amount_paid,'0') AS REAL) paid,
-            (SELECT COALESCE(SUM(CAST(a.amount AS REAL)),0) FROM payment_allocations a JOIN payments x ON x.id=a.payment_id WHERE a.invoice_id=i.id AND
-             (CASE WHEN x.payment_date GLOB '??-??-????' THEN substr(x.payment_date,7,4)||'-'||substr(x.payment_date,4,2)||'-'||substr(x.payment_date,1,2) ELSE x.payment_date END)<=?) allocated
-            FROM invoices i LEFT JOIN parties p ON p.id=i.party_id WHERE i.kind=? AND i.status IN ('posted','review')""", (as_of, kind))]
+            (SELECT COALESCE(SUM(CAST(a.amount AS REAL)),0) FROM payment_allocations a JOIN payments x ON x.id=a.payment_id WHERE a.invoice_id=i.id) allocated
+            FROM invoices i LEFT JOIN parties p ON p.id=i.party_id WHERE i.kind=? AND i.status IN ('posted','review')""", (kind,))]
         payment_kind = "customer_receipt" if kind == "sale" else "supplier_payment"
-        payments = [dict(r) for r in connection.execute("""SELECT x.party_id,x.kind,x.currency,x.payment_date,CAST(x.amount AS REAL) amount,
-            p.name party_name,p.kind party_kind,p.account_number,
-            (SELECT COALESCE(SUM(CAST(a.amount AS REAL)),0) FROM payment_allocations a WHERE a.payment_id=x.id) allocated
-            FROM payments x LEFT JOIN parties p ON p.id=x.party_id WHERE x.kind IN ('customer_receipt','supplier_payment')""")]
+        payments = [dict(r) for r in connection.execute("""SELECT x.party_id,x.currency,x.payment_date,CAST(x.amount AS REAL) amount,
+            (SELECT COALESCE(SUM(CAST(a.amount AS REAL)),0) FROM payment_allocations a WHERE a.payment_id=x.id) allocated FROM payments x WHERE x.kind=?""", (payment_kind,))]
     parties = {}
     for inv in invoices:
         try: day = iso_date(inv["invoice_date"])
         except ValueError: continue
         if day > as_of: continue
         sign = -1 if inv.get("doc_subtype") == "credit_note" else 1
-        open_amount = sign * (_d(inv["total"]) - _d(inv["paid"]) - _d(inv["allocated"]))
+        open_amount = _d(sign * inv["total"]) - _d(inv["paid"]) - _d(inv["allocated"])
         if abs(open_amount) < Decimal("0.01"): continue
         try: due = iso_date(inv["due_date"]) if inv.get("due_date") else (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=inv.get("due_days") or 0)).strftime("%Y-%m-%d")
         except ValueError: due = day
@@ -104,11 +101,8 @@ def ageing(db, options):
         try: day = iso_date(pay["payment_date"])
         except ValueError: continue
         free = _d(pay["amount"]) - _d(pay["allocated"])
-        if day > as_of or free <= 0: continue
-        if (kind == "sale" and pay["party_kind"] == "supplier") or (kind == "purchase" and pay["party_kind"] == "customer"): continue
-        party = parties.setdefault(pay["party_id"], {"name": pay["party_name"] or "-", "account": pay.get("account_number") or "",
-                                                     "buckets": [ZERO] * len(labels), "unallocated": ZERO, "invoices": [], "due_by": ZERO})
-        party["unallocated"] += convert(free, pay["currency"], day) * (1 if pay["kind"] == payment_kind else -1)
+        if day > as_of or free <= 0 or pay["party_id"] not in parties: continue
+        parties[pay["party_id"]]["unallocated"] += convert(free, pay["currency"], day)
     rows = []; totals = [ZERO] * len(labels); total_unallocated = ZERO
     for party in sorted(parties.values(), key=lambda p: -sum(p["buckets"], ZERO)):
         gross = sum(party["buckets"], ZERO); net = gross - party["unallocated"]; overdue = sum(party["buckets"][1:], ZERO)
@@ -290,8 +284,8 @@ def dashboard_charts(db, options):
     top = [[row[1], float(row[5])] for row in top if row[0] != ""]
     from ledger_reports import _load_lines, _digits
     cash = {}
-    column = basis
-    for line in _load_lines(db, {"posting_status": "posted", "first_column": column, "second_column": "none"}):
+    column = basis if basis in ("USD", "LBP") else "USD"
+    for line in _load_lines(db, {"posting_status": "posted"}):
         code = _digits(line["code"])
         if code.startswith(("51", "53")) and line["iso_date"] <= end: cash[line["code"]] = cash.get(line["code"], ZERO) + line["signed"][column]
     return {"basis": basis, "year": year, "months": [[calendar.month_abbr[i + 1], float(m[0]), float(m[1])] for i, m in enumerate(months)],

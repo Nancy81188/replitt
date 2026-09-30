@@ -35,19 +35,6 @@ class CompanyNamedFilesTest(unittest.TestCase):
         self.assertEqual((path.parent.name, path.name), ("MDCC International L.L.C", "MDCC International L.L.C_2025.db"))
         self.assertEqual(self.manager.database(created["id"], 2025).backup_label, "MDCC International L.L.C_2025")
 
-    def test_dot_company_name_and_registry_path_cannot_escape_data_directory(self):
-        created=self.manager.create_company({"name":"..","year":2025},self.master)
-        path=Path(created["years"][0]["database"]).resolve()
-        self.assertIn(self.manager.root.resolve(),path.parents)
-        self.assertTrue(path.exists())
-
-        data=self.manager._read()
-        data["companies"][0]["years"][0]["database"]=str((self.root/"companies"/".."/".."/"outside.db").resolve())
-        self.manager._write(data)
-        reloaded=CompanyManager(self.root/"saber_accounting_v0_7.db")
-        with self.assertRaisesRegex(ValueError,"inside the application data directory"):
-            reloaded.database(self.manager.list_companies()[0]["id"],2024)
-
     def test_renamed_company_files_and_backups_follow_the_new_name(self):
         self.manager.organize_files(); company = self.manager.list_companies()[0]
         backup = Path(self.manager.database(company["id"], 2024).backup())

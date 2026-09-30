@@ -23,8 +23,6 @@ import inventory
 import fixed_assets
 import vat_return
 
-MAX_REQUEST_BODY_BYTES = 22 * 1024 * 1024
-
 class ApiHandler(BaseHTTPRequestHandler):
     db: Database = None
     master_db: Database = None
@@ -103,27 +101,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         if path == "/api/companies": return self._json(200,{"items":self.company_manager.list_companies(user["role"]=="admin")})
         if not self._select_database(): return
         if self._module_denied(user, path): return
-        if path in ("/api/backups/download","/api/backups/folder","/api/backups") and user["role"]=="viewer":
-            return self._json(403,{"error":"Backup access is not available for viewer accounts"})
         if path == "/api/me":
             info={k:user[k] for k in ("id","username","role","language","expires_at")}; info["permissions"]={m:self.master_db.user_can(user,m) for m in ("payroll","vat")}
             return self._json(200,info)
         if path == "/api/fixed-assets":
             return self._json(200,{"items":fixed_assets.list_assets(self.db)})
-        if path.startswith("/api/fixed-assets/") and path.endswith("/attachments"):
-            try: return self._json(200,{"items":fixed_assets.list_attachments(self.db,int(path.split("/")[-2]))})
-            except KeyError: return self._json(404,{"error":"Asset not found"})
-            except Exception as exc: return self._json(400,{"error":str(exc)})
-        if path.startswith("/api/fixed-asset-attachments/"):
-            try:
-                attachment=fixed_assets.get_attachment(self.db,int(path.rsplit("/",1)[-1]))
-                attachment["content"]=base64.b64encode(attachment["content"]).decode("ascii")
-                return self._json(200,attachment)
-            except KeyError: return self._json(404,{"error":"Asset attachment not found"})
-            except Exception as exc: return self._json(400,{"error":str(exc)})
-        if path == "/api/fixed-assets/rollforward":
-            try: return self._json(200,fixed_assets.rollforward(self.db,self._query(parsed,"year","")))
-            except Exception as exc: return self._json(400,{"error":str(exc)})
         if path.startswith("/api/fixed-assets/") and path.endswith("/schedule"):
             try: return self._json(200,{"items":fixed_assets.schedule(self.db,int(path.split("/")[-2]))})
             except KeyError: return self._json(404,{"error":"Asset not found"})
@@ -357,10 +339,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             try:
                 target=self.db.backup_path(self._query(parsed,"name",""))
                 return self._json(200,{"name":target.name,"content":base64.b64encode(target.read_bytes()).decode("ascii")})
-            except ValueError as exc: return self._json(404,{"error":str(exc)})
-            except Exception:
-                traceback.print_exc()
-                return self._json(500,{"error":"Backup could not be downloaded"})
+            except Exception as exc: return self._json(400,{"error":str(exc)})
         if path == "/api/backups/folder": return self._json(200,{"folder":str(self.db._backups_dir())})
         if path == "/api/backups":
             return self._json(200,{"items":self.db.list_backups()})
@@ -455,14 +434,6 @@ class ApiHandler(BaseHTTPRequestHandler):
         if path == "/api/fixed-assets":
             try: return self._json(201,{"asset":fixed_assets.save_asset(self.db,body,user_id=user["id"])})
             except Exception as exc: return self._json(400,{"error":str(exc)})
-        if path.startswith("/api/fixed-assets/") and path.endswith("/attachments"):
-            try:
-                raw=base64.b64decode((body.get("content") or "").encode("ascii"),validate=True)
-                result=fixed_assets.add_attachment(self.db,int(path.split("/")[-2]),body.get("file_name"),
-                                                   body.get("mime_type"),raw,user["id"])
-                return self._json(200 if result["duplicate"] else 201,result)
-            except KeyError: return self._json(404,{"error":"Asset not found"})
-            except Exception as exc: return self._json(400,{"error":str(exc)})
         if path.startswith("/api/fixed-assets/") and path.endswith("/post"):
             try: return self._json(201,{"voucher":fixed_assets.post_period(self.db,int(path.split("/")[-2]),body.get("period_end"),user["id"],self.headers.get("X-Fiscal-Year"))})
             except Exception as exc: return self._json(400,{"error":str(exc)})
@@ -474,12 +445,6 @@ class ApiHandler(BaseHTTPRequestHandler):
             except Exception as exc: return self._json(400,{"error":str(exc)})
         if path.startswith("/api/invoices/") and path.endswith("/replace"):
             try: return self._json(200,{"invoice_id":self.db.replace_manual_invoice(int(path.split("/")[-2]),body.get("invoice",{}),body.get("items",[]),user["id"])})
-            except KeyError: return self._json(404,{"error":"Invoice not found"})
-            except Exception as exc: return self._json(400,{"error":str(exc)})
-        if path.startswith("/api/invoices/") and path.endswith("/returns"):
-            try:
-                result=self.db.create_invoice_return(int(path.split("/")[-2]),body.get("items",[]),body.get("return_date"),user["id"],body.get("request_id"))
-                return self._json(201,{"invoice":result})
             except KeyError: return self._json(404,{"error":"Invoice not found"})
             except Exception as exc: return self._json(400,{"error":str(exc)})
         if path.startswith("/api/invoices/") and path.endswith("/landed-cost"):
@@ -857,29 +822,9 @@ def _keep_alive_safe(method):
     """Read the whole request body first and always answer, so a kept-open connection stays in step."""
     def handle(self):
         self._responded = False
-        raw_length=self.headers.get("Content-Length", "0") or "0"
-        try: length = int(raw_length)
-        except (TypeError,ValueError):
-            self.close_connection=True
-            self._json(400,{"error":"Invalid request length"})
-            return
-        if length<0:
-            self.close_connection=True
-            self._json(400,{"error":"Invalid request length"})
-            return
-        if self.headers.get("Transfer-Encoding"):
-            self.close_connection=True
-            self._json(400,{"error":"Chunked request bodies are not supported"})
-            return
-        if length>MAX_REQUEST_BODY_BYTES:
-            self.close_connection=True
-            self._json(413,{"error":"Request body exceeds the 22 MB limit"})
-            return
+        try: length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError: length = 0
         self._raw_body = self.rfile.read(length) if length > 0 else b""
-        if len(self._raw_body)!=length:
-            self.close_connection=True
-            self._json(400,{"error":"Request body was incomplete"})
-            return
         try:
             method(self)
         except (BrokenPipeError, ConnectionResetError):
@@ -887,7 +832,7 @@ def _keep_alive_safe(method):
         except Exception as exc:
             traceback.print_exc()
             if self._responded: self.close_connection = True; return
-            try: self._json(500, {"error": "The data service could not complete the request"})
+            try: self._json(500, {"error": f"The data service could not complete the request: {exc}"})
             except Exception: self.close_connection = True
             return
         if not self._responded:

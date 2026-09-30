@@ -160,7 +160,7 @@ CREATE TABLE IF NOT EXISTS payroll_settings (
  id INTEGER PRIMARY KEY, date_from TEXT NOT NULL, date_to TEXT,
  tax_brackets TEXT NOT NULL, single_allowance TEXT NOT NULL DEFAULT '450000000',
  spouse_allowance TEXT NOT NULL DEFAULT '225000000', child_allowance TEXT NOT NULL DEFAULT '45000000',
- employee_nssf_rate TEXT NOT NULL DEFAULT '0.03', medical_rate TEXT NOT NULL DEFAULT '0.08',
+ employee_nssf_rate TEXT NOT NULL DEFAULT '0.03', medical_rate TEXT NOT NULL DEFAULT '0.11',
  end_service_rate TEXT NOT NULL DEFAULT '0.085', family_rate TEXT NOT NULL DEFAULT '0.06',
  employee_ceiling TEXT NOT NULL DEFAULT '0', medical_ceiling TEXT NOT NULL DEFAULT '0',
  family_ceiling TEXT NOT NULL DEFAULT '0', end_service_ceiling TEXT NOT NULL DEFAULT '0',
@@ -481,11 +481,6 @@ class Database:
             inv_cols={row["name"] for row in db.execute("PRAGMA table_info(invoices)")}
             for column,definition in (("doc_subtype","TEXT NOT NULL DEFAULT 'invoice'"),("invoice_discount_percent","TEXT"),("invoice_discount_amount","TEXT"),("gross_before_discount","TEXT"),("notes","TEXT")):
                 if column not in inv_cols: db.execute(f"ALTER TABLE invoices ADD COLUMN {column} {definition}")
-            if "return_request_id" not in inv_cols: db.execute("ALTER TABLE invoices ADD COLUMN return_request_id TEXT")
-            if "return_request_hash" not in inv_cols: db.execute("ALTER TABLE invoices ADD COLUMN return_request_hash TEXT")
-            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_invoice_return_request ON invoices(return_request_id) WHERE return_request_id IS NOT NULL")
-            item_cols={row["name"] for row in db.execute("PRAGMA table_info(invoice_items)")}
-            if "origin_item_id" not in item_cols: db.execute("ALTER TABLE invoice_items ADD COLUMN origin_item_id INTEGER")
             db.execute("""CREATE TABLE IF NOT EXISTS payment_allocations (id INTEGER PRIMARY KEY, payment_id INTEGER NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
                 invoice_id INTEGER NOT NULL, amount TEXT NOT NULL, created_at TEXT NOT NULL)""")
             # new default posting accounts for payroll (only where the old defaults were never changed)
@@ -509,21 +504,8 @@ class Database:
             db.execute("INSERT OR IGNORE INTO app_settings(key,value) VALUES('backup_interval_hours','24')")
             db.execute("INSERT OR IGNORE INTO app_settings(key,value) VALUES('last_scheduled_backup','')")
             default_brackets=json.dumps([[360000000,.02],[900000000,.04],[1800000000,.07],[3600000000,.11],[7200000000,.15],[13500000000,.20],[None,.25]])
-            if not db.execute("SELECT 1 FROM payroll_settings LIMIT 1").fetchone():
-                db.execute("""INSERT INTO payroll_settings(date_from,date_to,tax_brackets,created_at)
-                    VALUES('2025-01-01',NULL,?,?)""",(default_brackets,utcnow()))
-            else:
-                # Older startups inserted the factory 2025 row even after effective-dated rules
-                # existed. Remove only that untouched, overlapping factory row, never a user's row.
-                db.execute("""DELETE FROM payroll_settings WHERE date_from='2025-01-01'
-                    AND date_to IS NULL AND created_by IS NULL AND tax_brackets=?
-                    AND single_allowance='450000000' AND spouse_allowance='225000000' AND child_allowance='45000000'
-                    AND CAST(employee_ceiling AS REAL)=0 AND CAST(medical_ceiling AS REAL)=0 AND CAST(family_ceiling AS REAL)=0
-                    AND CAST(family_allowance_spouse AS REAL)=0 AND CAST(family_allowance_child AS REAL)=0
-                    AND EXISTS(SELECT 1 FROM payroll_settings AS previous
-                               WHERE previous.date_from<'2025-01-01' AND previous.date_to>='2025-01-01')
-                    AND EXISTS(SELECT 1 FROM payroll_settings AS following WHERE following.date_from>'2025-01-01')""",
-                    (default_brackets,))
+            db.execute("""INSERT OR IGNORE INTO payroll_settings(date_from,date_to,tax_brackets,created_at)
+                VALUES('2025-01-01',NULL,?,?)""",(default_brackets,utcnow()))
             db.executemany("""INSERT INTO accounts(code,name_en,name_ar,name_fr,type)
                 VALUES(?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET
                 name_en=excluded.name_en,name_ar=excluded.name_ar,name_fr=excluded.name_fr,type=excluded.type""",
@@ -612,36 +594,10 @@ class Database:
             rows=db.execute("SELECT employee_ceiling,medical_ceiling,family_ceiling FROM payroll_settings").fetchall()
             done=db.execute("SELECT value FROM app_settings WHERE key='lebanese_payroll_rules_auto'").fetchone()
         unconfigured=not rows or all(Decimal(str(r["employee_ceiling"] or 0))==0 and Decimal(str(r["medical_ceiling"] or 0))==0 and Decimal(str(r["family_ceiling"] or 0))==0 for r in rows)
-        if done:
-            self._upgrade_default_family_allowance_periods()
-            return
-        if not unconfigured: return
+        if done or not unconfigured: return
         self.apply_lebanese_payroll_rules(None)
         with self.connect() as db:
             db.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES('lebanese_payroll_rules_auto',?)",(utcnow(),))
-
-    def _upgrade_default_family_allowance_periods(self):
-        """Fill old zero-valued CNSS benefits only in unmodified auto-loaded periods."""
-        import lebanese_payroll
-        expected={period["date_from"]:period for period in lebanese_payroll.official_periods()}
-        unchanged=("tax_brackets","single_allowance","spouse_allowance","child_allowance",
-                   "employee_nssf_rate","medical_rate","family_rate","end_service_rate",
-                   "employee_ceiling","medical_ceiling","family_ceiling","end_service_ceiling",
-                   "max_children_deduction","transport_daily_exempt","default_transport_days",
-                   "schooling_annual_exempt","schooling_max_children","tax_rounding","minimum_wage",
-                   "family_allowance_max_children")
-        with self.connect() as db:
-            for row in db.execute("SELECT * FROM payroll_settings WHERE created_by IS NULL").fetchall():
-                preset=expected.get(row["date_from"])
-                if not preset or row["date_to"]!=preset["date_to"]: continue
-                try:
-                    if any((json.loads(row[field]) if field=="tax_brackets" else str(row[field]))!=
-                           (preset[field] if field=="tax_brackets" else str(preset[field])) for field in unchanged): continue
-                    if any(Decimal(str(row[field] or 0))!=0 for field in ("family_allowance_spouse","family_allowance_child","family_allowance_cap")): continue
-                except (ValueError,TypeError,ArithmeticError):
-                    continue  # Do not reinterpret a manually edited or malformed period.
-                db.execute("""UPDATE payroll_settings SET family_allowance_spouse=?, family_allowance_child=?, family_allowance_cap=?
-                    WHERE id=?""",(preset["family_allowance_spouse"],preset["family_allowance_child"],preset["family_allowance_cap"],row["id"]))
 
     @staticmethod
     def month_end(value):
@@ -1141,8 +1097,6 @@ class Database:
         with self.connect() as db:
             if str(invoice.get("source_file") or "")=="Journal Voucher":
                 db.execute("UPDATE journal_entries SET source_type='journal_voucher' WHERE source_type='invoice' AND source_id=?",(invoice_id,))
-            if invoice.get("linked_invoice_id"):
-                db.execute("UPDATE invoices SET linked_invoice_id=? WHERE id=?",(int(invoice["linked_invoice_id"]),invoice_id))
             db.executemany("""INSERT INTO invoice_items(invoice_id,description,quantity,unit_price,subtotal,deductible_subtotal,non_deductible_subtotal,vat_rate,vat,total,item_code)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?)""", [
                 (invoice_id,description,str(quantity),str(unit_price),str(subtotal),str(deductible),str(non_deductible),str(vat_rate),str(vat),str(total),item_code)
@@ -1156,40 +1110,18 @@ class Database:
             try: inventory.issue_for_invoice(self, invoice_id, line_items, user_id)
             except Exception:
                 self.delete_invoice(invoice_id, user_id); raise
-        # Preserve the supplier's invoiced VAT for the quarterly declaration.
-        # An exempt-use purchase has no input deduction: transfer that VAT from
-        # the receivable account into cost with a separate balanced entry.
-        if self._entry_type(invoice) != "sales" and invoice.get("vat_use") == "exempt" and vat_total and not invoice.get("skip_vat_reclass"):
-            try: self.set_vat_recoverable("invoice", invoice_id, False, user_id)
-            except Exception:
-                self.delete_invoice(invoice_id, user_id); raise
         return invoice_id
-
-    @staticmethod
-    def _assert_no_active_linked_returns(db,invoice_id,action):
-        linked=db.execute("""SELECT invoice_number FROM invoices WHERE linked_invoice_id=?
-            AND doc_subtype='credit_note' AND status NOT IN ('cancelled','deleted') LIMIT 1""",(int(invoice_id),)).fetchone()
-        if linked:
-            raise ValueError(f"Cannot {action} this invoice while active linked credit note {linked['invoice_number']} exists; cancel that credit note first")
-
-    @staticmethod
-    def _assert_credit_note_not_edited(db,invoice_id):
-        row=db.execute("SELECT doc_subtype,status FROM invoices WHERE id=?",(int(invoice_id),)).fetchone()
-        if row and row["doc_subtype"]=="credit_note" and row["status"] not in ("cancelled","deleted"):
-            raise ValueError("A posted credit note cannot be edited; cancel it and create a new reviewed return instead")
 
     def delete_invoice(self,invoice_id,user_id):
         with self.connect() as db:
             invoice=db.execute("SELECT * FROM invoices WHERE id=?",(int(invoice_id),)).fetchone()
             if not invoice: raise KeyError(invoice_id)
-            self._assert_no_active_linked_returns(db,invoice_id,"delete")
             self._assert_period_open(invoice["invoice_date"])
             details=dict(invoice)
             db.execute("DELETE FROM journal_entries WHERE source_type IN ('invoice','journal_voucher') AND source_id=?",(int(invoice_id),))
             db.execute("DELETE FROM journal_entries WHERE source_type='vat_reclass' AND entry_number=?",(f"VATND-INV-{int(invoice_id)}",))
             import inventory
             inventory.remove_invoice_documents(db,invoice_id)
-            inventory._assert_nonnegative_history(db)
             db.execute("DELETE FROM invoices WHERE id=?",(int(invoice_id),))
             db.execute("INSERT INTO audit_log(user_id,action,entity,entity_id,details,created_at) VALUES(?,?,?,?,?,?)",
                 (user_id,"delete","invoice",int(invoice_id),json.dumps({"invoice_number":details.get("invoice_number"),"party_id":details.get("party_id"),"total":details.get("total")}),utcnow()))
@@ -1201,7 +1133,6 @@ class Database:
             invoice=db.execute("SELECT * FROM invoices WHERE id=?",(int(invoice_id),)).fetchone()
             if not invoice: raise KeyError(invoice_id)
             if invoice["status"]=="deleted": raise ValueError("Invoice is already deleted")
-            self._assert_no_active_linked_returns(db,invoice_id,"delete")
             self._assert_period_open(invoice["invoice_date"])
             if db.execute("SELECT 1 FROM payment_allocations WHERE invoice_id=? LIMIT 1",(int(invoice_id),)).fetchone():
                 raise ValueError("Invoice has allocated payments. Remove the allocation before deleting it")
@@ -1209,7 +1140,6 @@ class Database:
                 raise ValueError("Invoice has linked documents. Resolve them before deleting it")
             import inventory
             inventory.remove_invoice_documents(db,invoice_id)
-            inventory._assert_nonnegative_history(db)
             db.execute("DELETE FROM journal_entries WHERE source_type IN ('invoice','journal_voucher','invoice_reversal') AND source_id=?",(int(invoice_id),))
             db.execute("DELETE FROM journal_entries WHERE source_type='vat_reclass' AND entry_number=?",(f"VATND-INV-{int(invoice_id)}",))
             db.execute("UPDATE invoices SET status='deleted',cancelled_at=?,cancellation_reason='Deleted' WHERE id=?",(utcnow(),int(invoice_id)))
@@ -1504,8 +1434,6 @@ class Database:
                 raise KeyError(invoice_id)
             if existing["status"] in ("cancelled","deleted"):
                 raise ValueError("Cancelled or deleted invoices cannot be edited")
-            self._assert_credit_note_not_edited(db,invoice_id)
-            self._assert_no_active_linked_returns(db,invoice_id,"edit")
             party_kind = "customer" if kind == "sale" else "supplier"
             party_name = str(item["party_name"]).strip()
             db.execute("INSERT OR IGNORE INTO parties(kind,name,currency) VALUES(?,?,?)", (party_kind, party_name, currency))
@@ -1617,7 +1545,6 @@ class Database:
                 raise KeyError(invoice_id)
             if invoice["status"] in ("cancelled","deleted"):
                 raise ValueError("Cancelled or deleted invoices cannot be cancelled again")
-            self._assert_no_active_linked_returns(db,invoice_id,"cancel")
             self._assert_period_open(invoice["invoice_date"])
             original = db.execute("SELECT * FROM journal_entries WHERE source_type IN ('invoice','journal_voucher') AND source_id=?", (invoice_id,)).fetchone()
             if not original:
@@ -1635,7 +1562,6 @@ class Database:
             db.execute("DELETE FROM journal_entries WHERE source_type='vat_reclass' AND entry_number=?",(f"VATND-INV-{int(invoice_id)}",))
             import inventory
             inventory.remove_invoice_documents(db,invoice_id)
-            inventory._assert_nonnegative_history(db)
             db.execute("INSERT INTO audit_log(user_id,action,entity,entity_id,details,created_at) VALUES(?,?,?,?,?,?)",
                        (user_id,"cancel","invoice",invoice_id,json.dumps({"reason":reason}),utcnow()))
         return self.get_invoice(invoice_id)
@@ -1673,122 +1599,8 @@ class Database:
     def invoice_detail(self, invoice_id):
         invoice=self.get_invoice(invoice_id)
         with self.connect() as db:
-            items=[dict(row) for row in db.execute("""SELECT ii.id,ii.description,ii.quantity,ii.unit_price,ii.subtotal,ii.deductible_subtotal,ii.non_deductible_subtotal,
-                ii.vat_rate,ii.vat,ii.total,ii.item_code,ii.unit,ii.discount_percent,ii.discount_amount,ii.gross_amount,
-                COALESCE((SELECT SUM(CAST(ret.quantity AS REAL)) FROM invoice_items ret JOIN invoices ri ON ri.id=ret.invoice_id
-                    WHERE ri.linked_invoice_id=? AND ri.status NOT IN ('cancelled','deleted') AND ret.origin_item_id=ii.id),0) returned_quantity,
-                COALESCE((SELECT SUM(CAST(ret.deductible_subtotal AS REAL)) FROM invoice_items ret JOIN invoices ri ON ri.id=ret.invoice_id
-                    WHERE ri.linked_invoice_id=? AND ri.status NOT IN ('cancelled','deleted') AND ret.origin_item_id=ii.id),0) returned_deductible_subtotal,
-                COALESCE((SELECT SUM(CAST(ret.non_deductible_subtotal AS REAL)) FROM invoice_items ret JOIN invoices ri ON ri.id=ret.invoice_id
-                    WHERE ri.linked_invoice_id=? AND ri.status NOT IN ('cancelled','deleted') AND ret.origin_item_id=ii.id),0) returned_non_deductible_subtotal,
-                COALESCE((SELECT SUM(CAST(ret.vat AS REAL)) FROM invoice_items ret JOIN invoices ri ON ri.id=ret.invoice_id
-                    WHERE ri.linked_invoice_id=? AND ri.status NOT IN ('cancelled','deleted') AND ret.origin_item_id=ii.id),0) returned_vat
-                FROM invoice_items ii WHERE ii.invoice_id=? ORDER BY ii.id""",(invoice_id,invoice_id,invoice_id,invoice_id,invoice_id))]
+            items=[dict(row) for row in db.execute("SELECT description,quantity,unit_price,subtotal,deductible_subtotal,non_deductible_subtotal,vat_rate,vat,total,item_code,unit,discount_percent,discount_amount,gross_amount FROM invoice_items WHERE invoice_id=? ORDER BY id",(invoice_id,))]
         return {"invoice":invoice,"items":items}
-
-    def create_invoice_return(self, invoice_id, returns, return_date, user_id, request_id):
-        request_id=str(request_id or "").strip()
-        if not request_id or len(request_id)>128:
-            raise ValueError("A stable return request ID is required")
-        request_hash=hashlib.sha256(json.dumps({"invoice_id":int(invoice_id),"items":returns,"return_date":return_date},
-            sort_keys=True,separators=(",",":"),default=str).encode("utf-8")).hexdigest()
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            previous=db.execute("SELECT * FROM invoices WHERE return_request_id=?",(request_id,)).fetchone()
-            if previous:
-                if int(previous["linked_invoice_id"] or 0)!=int(invoice_id):
-                    raise ValueError("This return request ID was already used for a different invoice")
-                if previous["return_request_hash"]!=request_hash:
-                    raise ValueError("This return request ID was already used with different return details")
-                return self.get_invoice(previous["id"])
-            return self._create_invoice_return_locked(invoice_id,returns,return_date,user_id,request_id,request_hash)
-
-    def _create_invoice_return_locked(self, invoice_id, returns, return_date, user_id, request_id, request_hash):
-        """Post a linked credit note for reviewed quantities; never create a payment or allocation."""
-        from decimal import ROUND_HALF_UP
-        source=self.get_invoice(int(invoice_id))
-        if source.get("status")!="posted":
-            raise ValueError("Returns can only be created from a posted invoice")
-        if source.get("doc_subtype")=="credit_note":
-            raise ValueError("A credit note cannot itself be returned")
-        try:
-            source_exchange_rate=Decimal(str(source.get("exchange_rate") or "0"))
-            if not source_exchange_rate.is_finite() or source_exchange_rate<=0: raise ValueError
-        except Exception as exc:
-            raise ValueError("The original invoice has no valid positive exchange rate; return not posted") from exc
-        originals=self.invoice_detail(int(invoice_id))["items"]
-        if not originals: raise ValueError("This invoice has no item lines to return; no return was created")
-        with self.connect() as db:
-            stock_source=db.execute("""SELECT w.code FROM stock_documents d JOIN warehouses w ON w.id=d.warehouse_id
-                WHERE d.invoice_id=? ORDER BY d.id DESC LIMIT 1""",(int(invoice_id),)).fetchone()
-        warehouse_code=stock_source["code"] if stock_source else "MAIN"
-        if not isinstance(returns,list) or not returns: raise ValueError("Select at least one return quantity")
-        by_id={int(row["id"]):row for row in originals}; requested={}
-        for row in returns:
-            try:
-                item_id=int(row["item_id"]); qty=Decimal(str(row["quantity"]))
-            except Exception as exc:
-                raise ValueError("Return lines need a valid invoice item and quantity") from exc
-            if item_id not in by_id or qty<=0:
-                raise ValueError("Return quantities must be positive and belong to the original invoice")
-            if item_id in requested: raise ValueError("A return line may only be selected once")
-            original=by_id[item_id]
-            remaining=Decimal(str(original["quantity"]))-Decimal(str(original["returned_quantity"] or 0))
-            if qty>remaining: raise ValueError(f"{original['description']}: only {remaining} remains returnable")
-            requested[item_id]=qty
-        cent=Decimal("0.01"); micro=Decimal("0.000001"); lines=[]
-        for item_id,qty in requested.items():
-            original=by_id[item_id]
-            remaining_qty=Decimal(str(original["quantity"]))-Decimal(str(original["returned_quantity"] or 0))
-            ratio=qty/remaining_qty
-            def part(field):
-                remainder=Decimal(str(original.get(field) or 0))-Decimal(str(original.get("returned_"+field) or 0))
-                return (remainder*ratio).quantize(cent,rounding=ROUND_HALF_UP)
-            deductible=part("deductible_subtotal"); non_deductible=part("non_deductible_subtotal"); vat=part("vat")
-            price=(deductible+non_deductible)/qty
-            lines.append({"description":original["description"],"quantity":str(qty),
-                "unit_price":str(price.quantize(micro,rounding=ROUND_HALF_UP)),
-                "deductible_subtotal":str(deductible),"non_deductible_subtotal":str(non_deductible),
-                "vat_rate":str(original["vat_rate"]),"vat":str(vat),"item_code":original.get("item_code"),
-                "unit":original.get("unit"),"discount_percent":"0","warehouse":warehouse_code,"origin_item_id":item_id})
-        is_sale=source["kind"]=="sale"; date=iso_date(return_date or source["invoice_date"],"Return date")
-        def opposite(side,default):
-            return "C" if str(side or default).upper()=="D" else "D"
-        invoice={"invoice_number":self.next_invoice_number("credit_note" if is_sale else "supplier_credit_note",date),
-            "invoice_date":date,"party_name":source["party_name"],"kind":"sales" if is_sale else "purchases",
-            "currency":source["currency"],"exchange_rate":str(source_exchange_rate),"status":"posted","source_file":"Sales Return" if is_sale else "Purchase Return",
-            "supplier_account":source["supplier_account"],"vat_account":source["vat_account"],
-            "expense_account":source["expense_account"],"expense_no_vat_account":source.get("expense_no_vat_account"),
-            "supplier_side":opposite(source.get("supplier_side"),"D" if is_sale else "C"),
-            "vat_side":opposite(source.get("vat_side"),"C" if is_sale else "D"),
-            "expense_side":opposite(source.get("expense_side"),"C" if is_sale else "D"),
-            "expense_no_vat_side":opposite(source.get("expense_no_vat_side"),"D"),
-            "vat_treatment":source.get("vat_treatment") or "standard","vat_use":source.get("vat_use") or "mixed",
-            "doc_subtype":"credit_note","amount_paid":"0","payment_method":"On Account (Not Cash)",
-            "notes":f"Return against {source['invoice_number']}","skip_vat_reclass":True,
-            "branch":source.get("branch_name"),"department_id":source.get("department_id"),"project_id":source.get("project_id"),
-            "linked_invoice_id":int(invoice_id)}
-        created=self.create_manual_invoice(invoice,lines,user_id)
-        with self.connect() as db:
-            db.execute("UPDATE invoices SET linked_invoice_id=?,return_request_id=?,return_request_hash=? WHERE id=?",
-                       (int(invoice_id),request_id,request_hash,created))
-            created_item_ids=[row["id"] for row in db.execute("SELECT id FROM invoice_items WHERE invoice_id=? ORDER BY id",(created,))]
-            for item_id,line in zip(created_item_ids,lines):
-                db.execute("UPDATE invoice_items SET origin_item_id=? WHERE id=?",(line["origin_item_id"],item_id))
-            returned_vat=sum(Decimal(str(line["vat"])) for line in lines)
-            if not is_sale and not source.get("vat_recoverable",1):
-                # Reverse the original non-deductible VAT reclassification (Dr VAT / Cr cost).
-                db.execute("UPDATE invoices SET vat_recoverable=0 WHERE id=?",(created,))
-                if returned_vat:
-                    row=db.execute("SELECT party_id,branch_id,currency,invoice_date,expense_account,vat_account FROM invoices WHERE id=?",(created,)).fetchone()
-                    entry=db.execute("""INSERT INTO journal_entries(entry_number,entry_date,description,source_type,source_id,currency,branch_id,created_by,created_at)
-                        VALUES(?,?,?,?,?,?,?,?,?)""",(f"VATND-INV-{created}",row["invoice_date"],f"Reverse non-deductible VAT {source['invoice_number']}",
-                        "vat_reclass",created,row["currency"],row["branch_id"],user_id,utcnow())).lastrowid
-                    for code,debit,credit in ((row["vat_account"],returned_vat,Decimal("0")),(row["expense_account"],Decimal("0"),returned_vat)):
-                        db.execute("INSERT INTO journal_lines(entry_id,account_id,party_id,description,debit,credit) VALUES(?,?,?,?,?,?)",
-                            (entry,self._account_id(db,code),row["party_id"],"Reverse non-deductible VAT reclassification",str(debit),str(credit)))
-        self._store_invoice_format(created,invoice,lines)
-        return self.get_invoice(created)
 
     def add_attachment(self, invoice_id, file_name, mime_type, content, user_id):
         if not file_name or not content:
@@ -2415,7 +2227,7 @@ class Database:
 
     def list_invoices(self, limit=500):
         with self.connect() as db:
-            return [dict(r) for r in db.execute("""SELECT i.id,i.invoice_number,i.invoice_date,p.name party_name,i.kind,i.entry_type,i.currency,i.exchange_rate,i.subtotal,i.deductible_subtotal,i.non_deductible_subtotal,i.vat,i.total,
+            return [dict(r) for r in db.execute("""SELECT i.id,i.invoice_number,i.invoice_date,p.name party_name,i.kind,i.entry_type,i.currency,i.subtotal,i.deductible_subtotal,i.non_deductible_subtotal,i.vat,i.total,
                 CASE WHEN i.status='deleted' THEN 0 ELSE COALESCE(CAST(i.debit_override AS REAL),CASE WHEN i.kind='sale' THEN CAST(i.total AS REAL) ELSE 0 END) END debit,
                 CASE WHEN i.status='deleted' THEN 0 ELSE COALESCE(CAST(i.credit_override AS REAL),CASE WHEN i.kind='purchase' THEN CAST(i.total AS REAL) ELSE 0 END) END credit,
                 i.status,i.currency_issue,i.supplier_account,i.vat_account,i.expense_account,i.expense_no_vat_account,
@@ -2423,7 +2235,7 @@ class Database:
                 i.due_date,i.payment_status,CAST(i.amount_paid AS REAL) amount_paid,i.payment_method,i.description,i.branch_id,COALESCE(b.name,'Head Office') branch_name,
                 CAST(i.total AS REAL)-CAST(i.amount_paid AS REAL) outstanding,i.cancelled_at,i.cancellation_reason,
                 (SELECT COUNT(*) FROM invoice_attachments x WHERE x.invoice_id=i.id) attachment_count,i.vat_recoverable,i.department_id,i.project_id,i.vat_treatment,i.vat_use,
-                i.doc_subtype,i.invoice_discount_percent,i.invoice_discount_amount,i.notes,i.linked_invoice_id
+                i.doc_subtype,i.invoice_discount_percent,i.invoice_discount_amount,i.notes
                 FROM invoices i LEFT JOIN parties p ON p.id=i.party_id LEFT JOIN branches b ON b.id=i.branch_id ORDER BY i.id DESC LIMIT ?""", (limit,))]
 
     def list_accounts(self):
@@ -2663,17 +2475,13 @@ class Database:
                 except ValueError: pass
             if not parsed: raise ValueError("As of Date must be DD-MM-YYYY")
         invoice_day="CASE WHEN i.invoice_date GLOB '??-??-????' THEN substr(i.invoice_date,7,4)||'-'||substr(i.invoice_date,4,2)||'-'||substr(i.invoice_date,1,2) ELSE i.invoice_date END"
-        payment_day="CASE WHEN x.payment_date GLOB '??-??-????' THEN substr(x.payment_date,7,4)||'-'||substr(x.payment_date,4,2)||'-'||substr(x.payment_date,1,2) ELSE x.payment_date END"
-        conditions=["i.status='posted'",f"{invoice_day}<=?"] ; parameters=[as_of.isoformat(),as_of.isoformat()]
+        conditions=["i.status='posted'","CAST(i.total AS REAL)>CAST(i.amount_paid AS REAL)",f"{invoice_day}<=?"] ; parameters=[as_of.isoformat()]
         if kind in ("sale","purchase"): conditions.append("i.kind=?"); parameters.append(kind)
         if currency: conditions.append("i.currency=?"); parameters.append(currency)
         with self.connect() as db:
             rows=[dict(row) for row in db.execute(f"""SELECT i.id,i.invoice_number,i.invoice_date,i.due_date,i.kind,i.currency,p.name party_name,p.account_number,
-                (CASE WHEN i.doc_subtype='credit_note' THEN -1 ELSE 1 END)*(CAST(i.total AS REAL)-CAST(COALESCE(i.amount_paid,'0') AS REAL)-
-                (SELECT COALESCE(SUM(CAST(a.amount AS REAL)),0) FROM payment_allocations a JOIN payments x ON x.id=a.payment_id
-                 WHERE a.invoice_id=i.id AND {payment_day}<=?)) outstanding FROM invoices i LEFT JOIN parties p ON p.id=i.party_id
+                CAST(i.total AS REAL)-CAST(i.amount_paid AS REAL) outstanding FROM invoices i LEFT JOIN parties p ON p.id=i.party_id
                 WHERE {' AND '.join(conditions)} ORDER BY p.name,i.due_date,i.invoice_date""",parameters)]
-        rows=[row for row in rows if abs(row["outstanding"])>=0.01]
         for row in rows:
             raw=row.get("due_date") or row.get("invoice_date"); due=as_of
             for pattern in ("%d-%m-%Y","%Y-%m-%d"):
@@ -2934,8 +2742,7 @@ class Database:
         - Retroactive salary is taxed as if paid in its own months (Retro From / To), and its NSSF uses the
           ceiling of each of those months.
         - Transport is exempt up to the daily amount x days worked; schooling up to the annual limit.
-        - NSSF uses the earnings base under CNSS Contribution System 11; transport and schooling are still
-          included even where part of them is exempt from salary tax. Branch ceilings are effective-dated.
+        - NSSF: employee and employer shares on the monthly ceilings of the period; end of service has no ceiling.
         - Tax is rounded up to the rounding amount (LBP 10,000 from 25-11-2024) and converted to the salary currency."""
         employee_id=int(item.get("employee_id") or 0); period=str(item.get("period_date") or "").strip()
         if not employee_id or not period: raise ValueError("Select an employee and payroll period")
@@ -2969,12 +2776,12 @@ class Database:
         if taxable_schooling_lbp>0: notes.append("Schooling above the exempt annual limit is taxed")
         allowance=setting("single_allowance")
         married=employee["marital_status"] in ("married","spouse"); spouse_works=married and bool(int(employee["spouse_works"] or 0))
-        child_deduction=setting("child_allowance")*min(children,int(setting("max_children_deduction","5")))
-        family_deduction=setting("spouse_allowance") if married and not spouse_works else D("0")
-        if spouse_works:
-            child_deduction/=2
-            notes.append("Working spouse: no spouse tax deduction; each child's tax deduction is halved (confirm dependent eligibility and the allocation with your accountant)")
-        family_deduction+=child_deduction
+        family_deduction=D("0")
+        if married: family_deduction+=setting("spouse_allowance")
+        family_deduction+=setting("child_allowance")*min(children,int(setting("max_children_deduction","5")))
+        if spouse_works and family_deduction>0:
+            family_deduction=family_deduction/2
+            notes.append("Family tax deduction halved: married and the spouse also works, so the family deduction is split between the two spouses (confirm the split with your accountant)")
         allowance+=family_deduction
         if children>int(setting("max_children_deduction","5")): notes.append(f"Family deduction limited to {int(setting('max_children_deduction','5'))} children")
         regular_lbp=to_lbp(money["salary"]+money["overtime"]+money["commission"])+taxable_transport_lbp+taxable_schooling_lbp
@@ -3004,11 +2811,8 @@ class Database:
         retro_tax_lbp=min(income_tax_lbp,max(D("0"),retro_tax).quantize(D("0.01")))
         income_tax=from_lbp(income_tax_lbp).quantize(D("0.01")); retro_tax_value=from_lbp(retro_tax_lbp).quantize(D("0.01"))
         taxable_lbp=max(D("0"),regular_lbp*12-allowance)/12+one_off_lbp
-        # CNSS Contribution System 11, Article 1, includes earnings and social allowances other than
-        # statutory family benefits paid on the Fund's behalf. Salary-tax exemptions do not exclude
-        # transport or schooling allowances from the NSSF base.
-        base_lbp=to_lbp(money["salary"]+money["transport"]+money["overtime"]+money["commission"]+
-                        money["schooling"]+money["bonus"]+money["thirteenth_month"])
+        # NSSF: salary, overtime, commission, bonus and 13th this month; retroactive salary in its own months.
+        base_lbp=to_lbp(money["salary"]+money["overtime"]+money["commission"]+money["bonus"]+money["thirteenth_month"])
         def contribution(ceiling_name,rate_name,base,month_settings):
             limit=D(str(month_settings.get(ceiling_name) or 0)); capped=min(base,limit) if limit>0 else base
             return capped*D(str(month_settings.get(rate_name) or 0))
@@ -3017,12 +2821,11 @@ class Database:
         if money["retro_salary"]:
             share=money["retro_salary"]/len(retro_months)
             for month in retro_months:
-                month_settings=self.payroll_settings_for(month); regular_month=to_lbp(money["salary"]+money["transport"]+
-                    money["overtime"]+money["commission"]+money["schooling"],month); extra=to_lbp(share,month)
+                month_settings=self.payroll_settings_for(month); regular_month=to_lbp(money["salary"]+money["overtime"]+money["commission"],month); extra=to_lbp(share,month)
                 for name,ceiling,rate in (("employee","employee_ceiling","employee_nssf_rate"),("medical","medical_ceiling","medical_rate"),("family","family_ceiling","family_rate"),("end_service","end_service_ceiling","end_service_rate")):
                     totals[name]+=contribution(ceiling,rate,regular_month+extra,month_settings)-contribution(ceiling,rate,regular_month,month_settings)
-        # Eligibility remains category-specific: the nationality/age shortcut below is only a warning-bearing
-        # approximation. Confirm CNSS coverage and any reciprocal-agreement exception before relying on it.
+        # Employer end-of-service (8.5%) is not due for foreign employees (not covered by the scheme) or for
+        # employees over 64 (past the end-of-service retirement age) - confirm eligibility with your accountant.
         age=None
         if employee["birth_date"]:
             try:
@@ -3035,8 +2838,7 @@ class Database:
         if totals["end_service"]>0 and (is_foreign or (age is not None and age>64)):
             totals["end_service"]=D("0")
             reason="foreign national" if is_foreign else "over 64"
-            notes.append(f"Employer end-of-service contribution was skipped by the app's nationality/age rule ({reason}); "
-                         "eligibility depends on the employee's CNSS category and must be confirmed before filing")
+            notes.append(f"Employer end-of-service (8.5%) exempted: employee is {reason} (confirm eligibility with your accountant)")
         nssf={name:(value.quantize(D("0.01")),from_lbp(value).quantize(D("0.01"))) for name,value in totals.items()}
         # NSSF family allowances paid with the salary on behalf of the NSSF (not taxable, offset against NSSF dues).
         allowance_lbp=D("0")
@@ -3058,7 +2860,7 @@ class Database:
         if not str(employee["mof_number"] or "").strip(): notes.append("MOF (tax) number missing in the employee file")
         gross=sum(money.values(),D("0"))
         net=(gross-income_tax-nssf["employee"][1]+family_allowance).quantize(D("0.01"))
-        salary_base=money["salary"]+money["transport"]+money["overtime"]+money["commission"]+money["schooling"]+money["retro_salary"]+money["bonus"]+money["thirteenth_month"]
+        salary_base=money["salary"]+money["overtime"]+money["commission"]+money["retro_salary"]+money["bonus"]+money["thirteenth_month"]
         return {**{k:float(v) for k,v in money.items()},"gross_salary":float(gross),"taxable_salary":float(from_lbp(taxable_lbp).quantize(D("0.01"))),
             "income_tax":float(income_tax),"income_tax_lbp":float(income_tax_lbp),"nssf_base":float(salary_base),"employee_nssf":float(nssf["employee"][1]),
             "employee_nssf_lbp":float(nssf["employee"][0]),"employer_medical":float(nssf["medical"][1]),"employer_end_service":float(nssf["end_service"][1]),
@@ -3453,8 +3255,6 @@ class Database:
             old = db.execute("SELECT * FROM invoices WHERE id=?", (int(invoice_id),)).fetchone()
             if not old: raise KeyError("Invoice not found")
             if old["status"] in ("deleted","cancelled"): raise ValueError("Deleted or cancelled invoices cannot be edited")
-            self._assert_credit_note_not_edited(db,invoice_id)
-            self._assert_no_active_linked_returns(db,invoice_id,"edit")
             files = [dict(r) for r in db.execute("SELECT file_name,mime_type,content FROM invoice_attachments WHERE invoice_id=?", (int(invoice_id),))]
             linked = [r["id"] for r in db.execute("SELECT id FROM invoices WHERE linked_invoice_id=?", (int(invoice_id),))]
             self._assert_period_open(old["invoice_date"])
@@ -3466,10 +3266,8 @@ class Database:
                 db.execute("INSERT INTO invoice_attachments(invoice_id,file_name,mime_type,content,uploaded_by,uploaded_at) VALUES(?,?,?,?,?,?)",
                     (new_id, f["file_name"], f["mime_type"], f["content"], user_id, utcnow()))
             for linked_id in linked: db.execute("UPDATE invoices SET linked_invoice_id=? WHERE id=?", (new_id, linked_id))
-            # Keep an explicitly blocked invoice blocked, but do not carry
-            # exempt-use automatic blocking into a newly taxable-use invoice.
-            if not old["vat_recoverable"] and old["vat_use"] != "exempt" and item.get("vat_use") != "exempt":
-                self.set_vat_recoverable("invoice", new_id, False, user_id)
+            if not old["vat_recoverable"]: db.execute("UPDATE invoices SET vat_recoverable=0 WHERE id=?", (new_id,))
+            if not old["vat_recoverable"]: self.set_vat_recoverable("invoice", new_id, False, user_id)
             self.delete_invoice(invoice_id, user_id)
             return new_id
 
@@ -3629,18 +3427,10 @@ class Database:
                 FROM invoices i WHERE i.party_id=? AND i.status NOT IN ('cancelled','deleted') ORDER BY i.id""", (int(party_id),))]
         for row in rows:
             sign = -1 if row.get("doc_subtype") == "credit_note" else 1
-            row["open_amount"] = round(sign * (row["total"] - row["paid"] - row["allocated"]), 2)
+            row["open_amount"] = round(sign * row["total"] - row["paid"] - row["allocated"], 2)
         return [r for r in rows if abs(r["open_amount"]) >= 0.01]
 
     def save_allocations(self, payment_id, allocations, user_id):
-        # An offset between documents needs its own party-control journal entry;
-        # payment allocations represent cash settlement only.
-        settlement_kind = {
-            ("sale", False): "customer_receipt",
-            ("sale", True): "supplier_payment",
-            ("purchase", False): "supplier_payment",
-            ("purchase", True): "customer_receipt",
-        }
         with self.connect() as db:
             payment = db.execute("SELECT * FROM payments WHERE id=?", (int(payment_id),)).fetchone()
             if not payment: raise KeyError("Payment not found")
@@ -3652,10 +3442,6 @@ class Database:
                 invoice = db.execute("SELECT * FROM invoices WHERE id=?", (int(entry["invoice_id"]),)).fetchone()
                 if not invoice or invoice["party_id"] != payment["party_id"]: raise ValueError("Allocate only to documents of the same customer / supplier")
                 if invoice["currency"] != payment["currency"]: raise ValueError(f"{invoice['invoice_number']} is in {invoice['currency']}; the payment is in {payment['currency']}")
-                expected = settlement_kind.get((invoice["kind"], invoice["doc_subtype"] == "credit_note"))
-                if expected != payment["kind"]:
-                    action = "an outgoing payment/refund" if expected == "supplier_payment" else "an incoming receipt/refund"
-                    raise ValueError(f"{invoice['invoice_number']} cannot be settled with this payment type; use {action}. To offset a credit note against an invoice, record a separate journal adjustment.")
                 total += amount
                 db.execute("INSERT INTO payment_allocations(payment_id,invoice_id,amount,created_at) VALUES(?,?,?,?)", (int(payment_id), invoice["id"], str(amount), utcnow()))
             if total > Decimal(str(payment["amount"])) + Decimal("0.005"): raise ValueError(f"Allocated {total:,.2f} is more than the payment {Decimal(str(payment['amount'])):,.2f}")
@@ -3666,8 +3452,7 @@ class Database:
             return [dict(r) for r in db.execute("""SELECT a.invoice_id,i.invoice_number,i.invoice_date,CAST(a.amount AS REAL) amount FROM payment_allocations a
                 JOIN invoices i ON i.id=a.invoice_id WHERE a.payment_id=? ORDER BY a.id""", (int(payment_id),))]
 
-    PERIOD_VALUE_FIELDS=("employee_ceiling","medical_ceiling","family_ceiling","end_service_ceiling","employee_nssf_rate","medical_rate","family_rate","end_service_rate",
-                         "family_allowance_spouse","family_allowance_child","family_allowance_cap","family_allowance_max_children")
+    PERIOD_VALUE_FIELDS=("employee_ceiling","medical_ceiling","family_ceiling","end_service_ceiling","employee_nssf_rate","medical_rate","family_rate","end_service_rate")
 
     def save_payroll_periods(self, periods, user_id):
         """Save the whole list of Tax & NSSF periods at once (edit Date From / Date To, ceilings and rates).

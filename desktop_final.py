@@ -70,30 +70,13 @@ class FinalFeaturesMixin:
             except ValueError: pass
 
     def scrollable_page(self, parent):
-        """A notebook page that exposes long and wide forms on small displays."""
+        """A notebook page with a vertical scrollbar for long forms."""
         outer = tk.Frame(parent, bg=LIGHT)
-        canvas = tk.Canvas(outer, bg=LIGHT, highlightthickness=0)
-        scroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        horizontal = ttk.Scrollbar(outer, orient="horizontal", command=canvas.xview)
+        canvas = tk.Canvas(outer, bg=LIGHT, highlightthickness=0); scroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         inner = tk.Frame(canvas, bg=LIGHT); window = canvas.create_window((0, 0), window=inner, anchor="nw")
-        def resize(_event=None):
-            width=max(canvas.winfo_width(),inner.winfo_reqwidth())
-            canvas.itemconfigure(window,width=width)
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            if inner.winfo_reqheight()>canvas.winfo_height()+1:
-                if not scroll.winfo_manager(): scroll.grid()
-            else: scroll.grid_remove()
-            if inner.winfo_reqwidth()>canvas.winfo_width()+1:
-                if not horizontal.winfo_manager(): horizontal.grid()
-            else: horizontal.grid_remove()
-        inner.bind("<Configure>", resize)
-        canvas.bind("<Configure>", resize)
-        outer.grid_rowconfigure(0,weight=1); outer.grid_columnconfigure(0,weight=1)
-        canvas.grid(row=0,column=0,sticky="nsew")
-        scroll.grid(row=0,column=1,sticky="ns")
-        horizontal.grid(row=1,column=0,sticky="ew")
-        canvas.configure(yscrollcommand=scroll.set,xscrollcommand=horizontal.set)
-        scroll.grid_remove(); horizontal.grid_remove()
+        inner.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
+        canvas.configure(yscrollcommand=scroll.set); canvas.pack(side="left", fill="both", expand=True); scroll.pack(side="right", fill="y")
         # The program-wide wheel handler scrolls this page. (It used to bind and then UNBIND the wheel
         # for the whole program when the mouse left the page, which stopped scrolling everywhere.)
         canvas._saber_scroll_page = True
@@ -110,7 +93,7 @@ class FinalFeaturesMixin:
             self.alerts_button.config(text=f"Document Alerts ({len(items)})" if items else "Document Alerts",
                                       bg=RED if result.get("expired") else GOLD if items else NAVY, fg="white" if result.get("expired") or not items else NAVY)
         if startup and not items: return
-        window = tk.Toplevel(self); window.title("Legal Document Alerts"); window.configure(bg=LIGHT); self.fit_dialog(window,900,420); window.transient(self)
+        window = tk.Toplevel(self); window.title("Legal Document Alerts"); window.configure(bg=LIGHT); window.geometry("900x420"); window.transient(self)
         headline = (f"{result.get('expired', 0)} expired and {result.get('expiring', 0)} expiring within {result.get('days', 30)} days"
                     if items else "No expired or expiring legal documents")
         tk.Label(window, text=headline, bg=LIGHT, fg=RED if result.get("expired") else NAVY, font=("Segoe UI", 12, "bold")).pack(pady=(12, 4))
@@ -151,7 +134,6 @@ class FinalFeaturesMixin:
         tk.Button(buttons, text="Generate", command=self.generate_payroll_report, bg=GOLD, fg=NAVY, border=0, padx=16, pady=6, font=("Segoe UI", 9, "bold")).pack(side="left", padx=3)
         self.action_button(buttons, "Export Excel", lambda: self.export_payroll_report("xlsx")).pack(side="left", padx=3)
         self.action_button(buttons, "Export PDF", lambda: self.export_payroll_report("pdf")).pack(side="left", padx=3)
-        self.action_button(buttons, "Open / Fill PDF", self.edit_payroll_report_pdf).pack(side="left", padx=3)
         self.action_button(buttons, "Employee List / Edit", lambda:self.payroll_notebook.select(self.payroll_employees_page)).pack(side="left",padx=3)
         self.action_button(buttons, "Filed NSSF Wages", self.edit_nssf_filed_wages).pack(side="left",padx=3)
         self.nssf_pay_button = tk.Button(buttons, text="Record NSSF Payment", command=self.record_nssf_payment, bg=GOLD, fg=NAVY, border=0, padx=12, pady=6, font=("Segoe UI", 9, "bold"))
@@ -250,7 +232,7 @@ class FinalFeaturesMixin:
         except Exception as exc: return messagebox.showerror("NSSF Filed Wages",str(exc))
         window=tk.Toplevel(self); window.title(f"NSSF filed wages and payments - {year}")
         window.configure(bg=LIGHT); window.transient(self); window.grab_set()
-        self.fit_dialog(window,1000,600,480,360)
+        window.geometry(f"{min(1000,self.winfo_screenwidth())}x{min(600,self.winfo_screenheight()-80)}")
         outer,form=self.scrollable_page(window); outer.pack(fill="both",expand=True)
         columns=("Month","Sickness filed (LBP)","Family filed (LBP)","End of service filed (LBP)","NSSF paid (LBP)")
         for col,title in enumerate(columns):
@@ -298,26 +280,6 @@ class FinalFeaturesMixin:
         name = f"{result['report']}_{result['period_label'].split(' (')[0].replace(' ', '_')}"
         self.save_sections(result["title"], result["meta"], result["sections"], name, format_name)
 
-    def edit_sections_pdf(self, title, meta, sections, name):
-        """Open a generated worksheet in the same fill-and-print viewer as official blanks."""
-        import tempfile
-        from pathlib import Path
-        from pdf_form_editor import open_pdf_form_editor
-        temporary=tempfile.TemporaryDirectory(prefix="saber-report-form-")
-        path=Path(temporary.name)/(name+".pdf")
-        try:
-            export_sections_pdf(path,title,meta,sections)
-            editor=open_pdf_form_editor(self,path)
-            editor._owned_tempdir=temporary
-        except Exception as exc:
-            temporary.cleanup()
-            messagebox.showerror(title,f"Could not open the PDF worksheet: {exc}")
-
-    def edit_payroll_report_pdf(self):
-        result=getattr(self,"payroll_report_result",None)
-        if not result: return messagebox.showwarning("Payroll Reports","Generate the report first")
-        self.edit_sections_pdf(result["title"],result["meta"],result["sections"],result["report"]+"_worksheet")
-
     def save_sections(self, title, meta, sections, name, format_name):
         extension = ".xlsx" if format_name == "xlsx" else ".pdf"
         path = filedialog.asksaveasfilename(defaultextension=extension, initialfile=name + extension,
@@ -330,21 +292,19 @@ class FinalFeaturesMixin:
 
     PERIOD_FIELDS = (("date_from", "Date From", 90), ("date_to", "Date To", 90), ("employee_ceiling", "Employee Ceiling", 115), ("medical_ceiling", "Sickness Ceiling", 115),
                      ("family_ceiling", "Family Ceiling", 110), ("end_service_ceiling", "EOS Ceiling", 95), ("employee_nssf_rate", "Employee %", 80), ("medical_rate", "Employer Sick. %", 100),
-                      ("family_rate", "Family %", 70), ("end_service_rate", "EOS %", 65),
-                      ("family_allowance_spouse", "Family / Spouse", 110), ("family_allowance_child", "Family / Child", 105),
-                      ("family_allowance_cap", "Family Maximum", 120), ("family_allowance_max_children", "Max Children", 90))
+                     ("family_rate", "Family %", 70), ("end_service_rate", "EOS %", 65))
 
     def build_payroll_periods_panel(self, parent, row):
         """NSSF ceilings and rates by period (Date From - Date To), edited directly like a spreadsheet."""
         from desktop_brains import EditableSheet
-        frame = tk.LabelFrame(parent, text="NSSF ceilings, rates and family allowance by period - double-click to edit (LBP / month, rates in %)", bg=LIGHT, padx=6, pady=4)
+        frame = tk.LabelFrame(parent, text="NSSF ceilings and rates by period - double-click a cell to change it (ceilings in LBP / month, rates in %)", bg=LIGHT, padx=6, pady=4)
         frame.grid(row=row, column=0, columnspan=6, padx=10, pady=6, sticky="ew")
         bar = tk.Frame(frame, bg=LIGHT); bar.pack(fill="x")
         self.action_button(bar, "Add Period", self.add_payroll_period).pack(side="left", padx=(0, 3))
         tk.Button(bar, text="Delete Period", command=self.delete_payroll_period, bg=RED, fg="white", border=0, padx=10, pady=5).pack(side="left", padx=3)
         tk.Button(bar, text="Save Periods", command=self.save_payroll_periods, bg=GOLD, fg=NAVY, border=0, padx=14, pady=5, font=("Segoe UI", 9, "bold")).pack(side="left", padx=3)
         tk.Label(bar, text="A new Date From ends the previous period the day before. Leave Date To empty for 'until further notice'.", bg=LIGHT, fg=MUTED).pack(side="left", padx=8)
-        self.periods_sheet = EditableSheet(self, frame, [("line", "#", 35, "center")] + [(k, l, w, "center" if k.startswith("date") else "e") for k, l, w in self.PERIOD_FIELDS],
+        self.periods_sheet = EditableSheet(self, frame, [("line", "#", 35, "center")] + [(k, l, w, "e" if "ceiling" in k or "rate" in k else "center") for k, l, w in self.PERIOD_FIELDS],
                                            [k for k, _l, _w in self.PERIOD_FIELDS], self.payroll_period_changed, height=6)
         self.payroll_periods_tree = self.periods_sheet.tree
         self.payroll_periods_tree.bind("<Button-3>", lambda _e: self.load_selected_payroll_period())
@@ -433,20 +393,13 @@ class FinalFeaturesMixin:
             tk.Button(actions, text="Reopen Saved Return", command=self.reopen_vat_return, bg=RED, fg="white", border=0, padx=14, pady=7).pack(side="left", padx=3)
         self.action_button(actions, "Export Excel", lambda: self.export_vat_return("xlsx")).pack(side="left", padx=3)
         self.action_button(actions, "Export PDF", lambda: self.export_vat_return("pdf")).pack(side="left", padx=3)
-        self.action_button(actions, "Filing Worksheet PDF", lambda: self.export_vat_filing_worksheet("pdf")).pack(side="left", padx=3)
-        self.action_button(actions, "Open / Fill VAT PDF", self.edit_vat_filing_worksheet).pack(side="left", padx=3)
-        self.action_button(actions, "Filing Worksheet Excel", lambda: self.export_vat_filing_worksheet("xlsx")).pack(side="left", padx=3)
         self.vat_headline = tk.Label(page, text="Choose the year and quarter, then press Generate.", bg=LIGHT, fg=NAVY, font=("Segoe UI", 11, "bold"), anchor="w", justify="left")
         self.vat_headline.pack(fill="x", padx=12, pady=(8, 0))
         self.vat_note = tk.Label(page, text="", bg=LIGHT, fg=MUTED, anchor="w", justify="left"); self.vat_note.pack(fill="x", padx=12)
         nested = ttk.Notebook(page); nested.pack(fill="both", expand=True, padx=10, pady=8)
-        summary = tk.Frame(nested, bg=LIGHT); filing = tk.Frame(nested, bg=LIGHT); documents = tk.Frame(nested, bg=LIGHT); adjustments = tk.Frame(nested, bg=LIGHT); history = tk.Frame(nested, bg=LIGHT)
+        summary = tk.Frame(nested, bg=LIGHT); documents = tk.Frame(nested, bg=LIGHT); adjustments = tk.Frame(nested, bg=LIGHT); history = tk.Frame(nested, bg=LIGHT)
         nested.add(summary, text="VAT Return"); nested.add(documents, text="Supporting Documents"); nested.add(adjustments, text="Manual Adjustments"); nested.add(history, text="Saved Returns")
-        nested.insert(1, filing, text="Filing Worksheet")
         self.vat_summary_tree = self.report_viewer(summary, [55, 390, 330, 115, 115, 125])
-        self.vat_filing_tree = self.report_viewer(filing, [110, 390, 330, 160, 170])
-        tk.Label(filing, text="Based on published 2010 Q1-2 / Q11-2 specimen sections only. Not an official form; A-F are internal refs. Obtain issued forms from the VAT Directorate.",
-                 bg=LIGHT, fg=RED, anchor="w", justify="left", wraplength=900).pack(fill="x", padx=10, pady=4)
         self.vat_documents_tree = self.table(documents, [("date", "Date", 90), ("number", "Document", 120), ("party", "Customer / Supplier", 200), ("category", "Category", 140),
             ("deductible", "Deductible", 80), ("currency", "Currency", 70), ("base", "Base", 110), ("vat", "VAT", 100), ("rate", "LBP Rate", 90), ("vat_lbp", "VAT (LBP)", 120), ("status", "Status", 75)])
         form = tk.Frame(adjustments, bg=LIGHT); form.pack(fill="x", padx=10, pady=8)
@@ -488,16 +441,6 @@ class FinalFeaturesMixin:
         self.vat_return_result = result
         title, meta, sections = vat_rules.export_sections(result)
         self.show_sections(self.vat_summary_tree, [s for s in sections if s["heading"] not in ("Supporting documents", "Manual adjustments")])
-        if result["currency_filter"] == "All" and not result["include_review"]:
-            try:
-                notices, filing_sections = vat_rules.filing_worksheet(result, self.client.settings())
-                self.show_sections(self.vat_filing_tree, filing_sections)
-            except Exception as exc:
-                self.vat_filing_tree.delete(*self.vat_filing_tree.get_children())
-                self.vat_filing_tree.insert("", "end", values=("Filing worksheet unavailable", str(exc)))
-        else:
-            self.vat_filing_tree.delete(*self.vat_filing_tree.get_children())
-            self.vat_filing_tree.insert("", "end", values=("Select All Currencies and untick Include Review documents",))
         payable = result["payable_lbp"]; credit_cf = result["credit_carried_forward_lbp"]
         outcome = f"VAT PAYABLE: {payable:,.0f} LBP" if payable else f"CREDIT CARRIED FORWARD: {credit_cf:,.0f} LBP" if credit_cf else "NIL RETURN: 0 LBP"
         if result.get("provisional_ratio") is not None and not self.vat_ratio.get().strip(): self.vat_ratio.set(f'{float(result["provisional_ratio"]) * 100:g}')
@@ -573,22 +516,6 @@ class FinalFeaturesMixin:
         if not result: return messagebox.showwarning("Quarterly VAT", "Generate the return first")
         title, meta, sections = vat_rules.export_sections(result)
         self.save_sections(title, meta, sections, f"VAT_Return_Q{result['quarter']}_{result['year']}", format_name)
-
-    def export_vat_filing_worksheet(self, format_name):
-        result = getattr(self, "vat_return_result", None)
-        if not result: return messagebox.showwarning("Quarterly VAT", "Generate the return first")
-        try: notices, sections = vat_rules.filing_worksheet(result, self.client.settings())
-        except Exception as exc: return messagebox.showwarning("Quarterly VAT", str(exc))
-        self.save_sections(f"Quarterly VAT filing worksheet - Q{result['quarter']} {result['year']}",
-                           notices, sections, f"VAT_Filing_Worksheet_Q{result['quarter']}_{result['year']}", format_name)
-
-    def edit_vat_filing_worksheet(self):
-        result=getattr(self,"vat_return_result",None)
-        if not result: return messagebox.showwarning("Quarterly VAT","Generate the return first")
-        try: notices,sections=vat_rules.filing_worksheet(result,self.client.settings())
-        except Exception as exc: return messagebox.showwarning("Quarterly VAT",str(exc))
-        self.edit_sections_pdf(f"Quarterly VAT filing worksheet - Q{result['quarter']} {result['year']}",
-                               notices,sections,f"VAT_Filing_Worksheet_Q{result['quarter']}_{result['year']}")
 
     def toggle_selected_invoice_vat(self):
         selected = self.invoice_tree.selection()

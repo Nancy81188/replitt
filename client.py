@@ -173,24 +173,10 @@ class ApiClient:
     def save_journal_voucher(self,voucher,lines,entry_id=None): return self.request("PUT" if entry_id else "POST",f"/api/journal-vouchers/{entry_id}" if entry_id else "/api/journal-vouchers",{"voucher":voucher,"lines":lines})
     def fixed_assets(self): return self.request("GET","/api/fixed-assets")["items"]
     def asset_schedule(self,asset_id): return self.request("GET",f"/api/fixed-assets/{asset_id}/schedule")["items"]
-    def asset_rollforward(self,year): return self.request("GET",f"/api/fixed-assets/rollforward?year={year}")
     def save_asset(self,item,asset_id=None): return self.request("PUT" if asset_id else "POST",f"/api/fixed-assets/{asset_id}" if asset_id else "/api/fixed-assets",item)["asset"]
-    def asset_attachments(self,asset_id): return self.request("GET",f"/api/fixed-assets/{asset_id}/attachments")["items"]
-    def upload_asset_attachment(self,asset_id,file_name,mime_type,content):
-        if not content or len(content)>15*1024*1024:
-            raise ValueError("Asset PDF attachment must be non-empty and cannot exceed 15 MB")
-        return self.request("POST",f"/api/fixed-assets/{asset_id}/attachments",{
-            "file_name":file_name,"mime_type":mime_type,"content":base64.b64encode(content).decode("ascii")})
-    def download_asset_attachment(self,attachment_id):
-        result=self.request("GET",f"/api/fixed-asset-attachments/{attachment_id}")
-        result["content"]=base64.b64decode(result["content"])
-        return result
     def post_asset_period(self,asset_id,period_end): return self.request("POST",f"/api/fixed-assets/{asset_id}/post",{"period_end":period_end})["voucher"]
     def delete_asset(self,asset_id): return self.request("DELETE",f"/api/fixed-assets/{asset_id}")
     def invoice_detail(self, invoice_id): return self.request("GET",f"/api/invoices/{invoice_id}/detail")
-    def create_invoice_return(self, invoice_id, items, return_date=None, request_id=None):
-        return self.request("POST",f"/api/invoices/{invoice_id}/returns",{
-            "items":items,"return_date":return_date,"request_id":request_id})["invoice"]
     def cancel_invoice(self, invoice_id, reason): return self.request("POST",f"/api/invoices/{invoice_id}/cancel",{"reason":reason})["invoice"]
     def duplicate_invoice(self, invoice_id): return self.request("POST",f"/api/invoices/{invoice_id}/duplicate",{})["invoice"]
     def invoice_history(self, invoice_id): return self.request("GET",f"/api/invoices/{invoice_id}/history")["items"]

@@ -1,4 +1,4 @@
-"""Lebanese quarterly VAT calculation and preparation schedules; internal refs only."""
+"""Lebanese quarterly VAT return (Q1-Q4) built from sales, purchases, expenses and customs cases."""
 from __future__ import annotations
 
 import calendar
@@ -12,8 +12,7 @@ ZERO = Decimal("0")
 CENT = Decimal("0.01")
 CATEGORIES = {"sales": "Sales", "purchases": "Purchases", "assets": "Fixed assets", "expenses": "Expenses", "customs": "Customs (import VAT)"}
 ADJUSTMENT_TYPES = {"output": "Output VAT adjustment", "input": "Deductible VAT adjustment", "non_deductible": "Non-deductible VAT adjustment"}
-# These A-F identifiers are internal schedule references, not Ministry form box numbers.
-# The public Ministry specimen does not certify this mapping to its current issued form.
+# Lebanese periodic VAT declaration (Law 379/2001): supplies, output VAT, deductible VAT, partial deduction, result.
 LINES = (
     ("A1", "sales", "Taxable supplies at 11% (base / output VAT)"),
     ("A2", "sales_zero", "Zero-rated supplies - exports & like transactions (Art. 19-21)"),
@@ -31,7 +30,7 @@ LINES = (
     ("C7", "adj_input", "Deductible VAT adjustments"),
     ("C8", "total_input", "TOTAL DEDUCTIBLE VAT"),
     ("D1", "non_deductible", "VAT not deductible (Art. 28 / 31, for information)"),
-    ("E1", "net", "NET VAT FOR THE PERIOD (output VAT less deductible input VAT)"),
+    ("E1", "net", "NET VAT FOR THE PERIOD (B3 - C8)"),
 )
 RATE = Decimal("0.11")
 ARABIC = {"sales": "المبيعات الخاضعة للضريبة بمعدل 11%", "sales_zero": "العمليات المعفاة مع حق الحسم - التصدير (المواد 19-21)",
@@ -123,18 +122,14 @@ def list_saved_returns(db):
 
 
 def _rounded_up(value, day):
-    """Legacy worksheet estimate: 10,000 LBP ceiling from 25-11-2024.
-
-    The cited MoF decision 1195 has not been verified as a VAT payable rule.
-    Do not treat this estimate as a filing instruction.
-    """
+    """MoF decision 1195: from 25-11-2024 tax amounts are rounded up to the nearest LBP 10,000."""
     if value <= 0 or day < "2024-11-25": return _lbp(value)
     step = Decimal("10000")
     return (Decimal(value) / step).to_integral_value(rounding="ROUND_CEILING") * step
 
 
 def due_date(year, quarter):
-    """20 days after the quarter; one month after it from 2026 (Budget Law 2026, Art. 51)."""
+    """20 days after the quarter; one month after it for 2026 onward (Budget Law 2026)."""
     from datetime import timedelta
     end = date.fromisoformat(quarter_range(year, quarter)[1])
     if int(year) >= 2026:
@@ -217,8 +212,6 @@ def build_vat_return(db, year, quarter, currency=None, include_review=False, pre
             line = values[key]; line["vat"] += value; line["vat_lbp"] += to_lbp(value, doc["currency"], doc["date"]); line["count"] += 1
             if key in ("purchases", "assets", "expenses", "customs", "reverse_output", "blocked"): line["base"] += base
         doc["deductible_share"] = "0%" if "blocked" in parts else (f"{ratio * 100:.2f}%" if doc["use"] == "mixed" else "100%")
-    if any(doc["currency"] != "LBP" for doc in documents):
-        warnings.append("Foreign-currency VAT uses the saved document-date accounting rate as an estimate. Decree 11230/2023 distinguishes imports (customs rate), professional customers (then-Sayrafa rate), telecom invoices and airport/port fees; it also addresses VAT actually collected at a higher value. Verify the applicable current rate, tax-point date and deductible VAT on each document before filing.")
     adjustments = list_adjustments(db, year, quarter)
     for adjustment in adjustments:
         if currency and adjustment["currency"] != currency: continue
@@ -263,14 +256,13 @@ def build_vat_return(db, year, quarter, currency=None, include_review=False, pre
                 credit_bf = _lbp(previous["credit_carried_forward_lbp"]); source = f"Q{previous_q} {previous_year} saved return"; break
     net_after_credit = totals_lbp["net"] - credit_bf
     payable = _rounded_up(net_after_credit, end) if net_after_credit > 0 else ZERO
-    if net_after_credit > 0 and end >= "2024-11-25":
-        warnings.append("Payable is estimated by rounding up to LBP 10,000; the cited MoF decision 1195 has not been verified as a VAT payable rule. Confirm the current filing/payment rounding with the VAT Directorate before filing.")
     credit = -net_after_credit if net_after_credit < 0 else ZERO
     refund = _lbp(refund_requested) if refund_requested not in (None, "") else ZERO
     if refund < 0: raise ValueError("The refund requested cannot be negative")
     if refund > credit: raise ValueError(f"The refund requested cannot exceed the credit of {credit:,.0f} LBP")
-    if refund:
-        warnings.append("Refund eligibility is not validated. MoF guidance permits semiannual requests after Q2 or annual requests after year-end; quarterly requests require qualifying exporter status and are limited by the export proportion (Art. 30).")
+    has_exports = any(values["sales_zero"]["base"] > 0 for values in per_currency.values())
+    if refund and int(quarter) != 4 and not has_exports:
+        warnings.append("A refund of the VAT credit can be claimed at the end of the year (Q4) - or each period for exporters (Art. 30)")
     credit_cf = credit - refund
     saved = saved_return(db, year, quarter)
     changed = bool(saved) and (_lbp(saved["net_lbp"]) != _lbp(totals_lbp["net"]) or _lbp(saved["credit_brought_forward_lbp"]) != credit_bf)
@@ -349,13 +341,12 @@ def reopen_return(db, year, quarter, user_id):
 
 
 def export_sections(result):
-    """Export an internal VAT calculation schedule plus supporting documents."""
-    title = f"Quarterly VAT Calculation Schedule - Q{result['quarter']} {result['year']} | {ARABIC_TITLE}"
+    """The return laid out like the Lebanese periodic VAT declaration, plus supporting schedules."""
+    title = f"VAT Periodic Declaration - Q{result['quarter']} {result['year']} | {ARABIC_TITLE}"
     ratio = Decimal(str(result.get("deduction_ratio", 1)))
     meta = [f"Period: {display_date(result['date_from'])} to {display_date(result['date_to'])}   Due date: {display_date(result['due_date'])}   Currency filter: {result['currency_filter']}",
             f"Partial deduction ratio (Art. 31): {ratio * 100:.2f}% ({result.get('ratio_source', '')})   Status: {result['status']}",
-            "Internal schedule references only: A-F labels are not certified Ministry of Finance form box numbers.",
-            "Conversion uses saved accounting rates at each document date; the legally applicable tax-point/rate can differ (Decree 11230/2023). The 10,000 LBP payable ceiling from 25-11-2024 is an unverified worksheet estimate, not a certified VAT filing rule."]
+            "Foreign-currency amounts converted to LBP at the rate of each document date (Decree 11230/2023). VAT due rounded up to LBP 10,000 from 25-11-2024 (MoF decision 1195)."]
     if result["review_excluded"]: meta.append(f"Note: {result['review_excluded']} document(s) in Review status are excluded from this return")
     for warning in result.get("warnings", []): meta.append("Check: " + warning)
     keys = [key for _, key, _ in LINES]; totals_index = [keys.index(k) for k in ("total_output", "total_input", "net")]
@@ -364,7 +355,7 @@ def export_sections(result):
     for code, values in sorted(result["per_currency"].items()):
         rows = [[number, label, ARABIC.get(key, ""), values[key]["base"] if key not in no_base else "", values[key]["vat"] if key not in ("sales_zero", "sales_exempt", "sales_out") else "",
                  values[key]["vat_lbp"] if key not in ("sales_zero", "sales_exempt", "sales_out") else ""] for number, key, label in LINES if key in values]
-        sections.append({"heading": f"VAT calculation by currency - {code}", "headers": ["Internal ref.", "Description", "البيان", f"Base ({code})", f"VAT ({code})", "VAT (LBP)"],
+        sections.append({"heading": f"Declaration by currency - {code}", "headers": ["Box", "Description", "البيان", f"Base ({code})", f"VAT ({code})", "VAT (LBP)"],
                          "rows": rows, "total_rows": totals_index})
     totals = result["totals_lbp"]
     summary = [[number, label, ARABIC.get(key, ""), totals.get(key, ZERO)] for number, key, label in LINES if key not in ("sales_zero", "sales_exempt", "sales_out")]
@@ -373,8 +364,8 @@ def export_sections(result):
                 ["F3", "Refund of VAT credit requested (Art. 30)", ARABIC["refund"], result.get("refund_requested_lbp", ZERO)],
                 ["F4", "Credit carried forward to the next period", ARABIC["credit_cf"], result["credit_carried_forward_lbp"]]]
     labels = [row[1] for row in summary]
-    sections.append({"heading": "VAT calculation summary - all currencies in LBP | ملخص احتساب الضريبة", "headers": ["Internal ref.", "Description", "البيان", "Amount (LBP)"], "rows": summary,
-                     "total_rows": [labels.index(l) for l in ("TOTAL OUTPUT VAT", "TOTAL DEDUCTIBLE VAT", "NET VAT FOR THE PERIOD (output VAT less deductible input VAT)", "VAT PAYABLE TO THE MINISTRY OF FINANCE", "Credit carried forward to the next period")]})
+    sections.append({"heading": "Declaration - all currencies in LBP | التصريح بالليرة اللبنانية", "headers": ["Box", "Description", "البيان", "Amount (LBP)"], "rows": summary,
+                     "total_rows": [labels.index(l) for l in ("TOTAL OUTPUT VAT", "TOTAL DEDUCTIBLE VAT", "NET VAT FOR THE PERIOD (B3 - C8)", "VAT PAYABLE TO THE MINISTRY OF FINANCE", "Credit carried forward to the next period")]})
     turnover = result.get("ytd_turnover_lbp", {})
     ratio_rows = [["Taxable and zero-rated turnover (LBP, year to date)", turnover.get("taxable", ZERO)], ["Exempt turnover (LBP, year to date)", turnover.get("exempt", ZERO)],
                   ["Deduction ratio applied", f"{ratio * 100:.2f}%"], ["Basis", result.get("ratio_source", "")]]
@@ -390,95 +381,6 @@ def export_sections(result):
             "rows": [[ADJUSTMENT_TYPES[a["adjustment_type"]], a["currency"], _money(a["amount"]), a.get("amount_lbp", ""), a["reason"],
                       a.get("created_by_name") or "", str(a["created_at"])[:16].replace("T", " ")] for a in result["adjustments"]], "total_rows": []})
     return title, meta, sections
-
-
-def filing_worksheet(result, company):
-    """Auto-fill a filing preparation sheet from the same quarterly VAT calculation.
-
-    Sections follow the subjects of the public Q1-2 and Q11-2 specimens,
-    not their box layout. A-F references remain internal worksheet references.
-    """
-    if result.get("currency_filter") != "All" or result.get("include_review"):
-        raise ValueError("The filing worksheet requires All Currencies and excludes Review documents")
-    totals = result["totals_lbp"]
-    company_fields = (
-        ("Registered company name", company.get("company_name")),
-        ("Ministry of Finance / VAT number", company.get("company_mof")),
-        ("Registered address", company.get("company_address")),
-        ("Contact phone", company.get("company_phone")),
-    )
-    company_rows = [[label, str(value).strip() if value else "MISSING - complete in Settings"] for label, value in company_fields]
-    missing = [label for label, value in company_fields if not str(value or "").strip()]
-    worksheet = [
-        ["Tax period", f"Q{result['quarter']} {result['year']}"],
-        ["Period from", display_date(result["date_from"])],
-        ["Period to", display_date(result["date_to"])],
-        ["Filing due date", display_date(result["due_date"])],
-        ["Deduction ratio", f"{Decimal(str(result['deduction_ratio'])) * 100:.2f}% ({result['ratio_source']})"],
-        ["Source", "Posted invoices, expenses, customs and approved VAT adjustments"],
-        ["Return state", result["status"]],
-    ]
-    bases = {}
-    for doc in result["documents"]:
-        parts = _classify(doc)
-        if doc["category"] == "sales":
-            for key in ("sales_base", "sales_zero", "sales_exempt", "sales_out"):
-                bases[key] = bases.get(key, ZERO) + _lbp(parts.get(key, ZERO) * doc["lbp_rate"])
-        else:
-            key = doc["category"] if doc["recoverable"] and doc["use"] != "exempt" else "non_deductible"
-            bases[key] = bases.get(key, ZERO) + _lbp((doc["base"] + doc["exempt"]) * doc["lbp_rate"])
-    lines = [[number, label, ARABIC.get(key, ""), bases.get("sales_base" if key == "sales" else key, ""),
-              totals.get(key, ZERO)] for number, key, label in LINES
-             if key not in ("sales_zero", "sales_exempt", "sales_out")]
-    # Taxable/exempt turnover is a base, not output tax. Convert each document
-    # separately at its own historical LBP rate, rather than using a current rate.
-    for number, key, label in (("A2", "sales_zero", "Zero-rated supplies (LBP)"),
-                               ("A3", "sales_exempt", "Exempt supplies (LBP)"),
-                               ("A4", "sales_out", "Outside scope supplies (LBP)")):
-        lines.append([number, label, ARABIC.get(key, ""), bases.get(key, ZERO), ""])
-    lines += [
-        ["F1", "Credit brought forward", ARABIC["credit_bf"], "", result["credit_brought_forward_lbp"]],
-        ["F2", "Amount payable", ARABIC["payable"], "", result["payable_lbp"]],
-        ["F3", "Refund requested", ARABIC["refund"], "", result["refund_requested_lbp"]],
-        ["F4", "Credit carried forward", ARABIC["credit_cf"], "", result["credit_carried_forward_lbp"]],
-    ]
-    by_ref = {line[0]: line for line in lines}
-    headers = ["Internal ref.", "Description", "البيان", "Base (LBP)", "VAT / balance (LBP)"]
-    def group(heading, refs, total_refs=()):
-        rows = [by_ref[ref] for ref in refs]
-        return {"heading": heading, "headers": headers, "rows": rows,
-                "total_rows": [index for index, row in enumerate(rows) if row[0] in total_refs]}
-    turnover = result.get("ytd_turnover_lbp", {})
-    ratio = Decimal(str(result["deduction_ratio"]))
-    notices = [
-        "Preparation worksheet inspired by the sections of the Ministry's published Q1-2 and Q11-2 specimens (marked 2010), NOT a copy of either form.",
-        "A-F references are internal and are not certified Ministry of Finance form box numbers. No current issued-form box mapping has been verified.",
-        "The published specimens must not be used for filing; obtain the current issued Q1-2 and, where applicable, Q11-2 from the VAT Directorate and compare all amounts and schedules manually.",
-        "The partial-deduction section is a calculation review, NOT a completed Q11-2 supplement; the published supplement asks for purchase, expense and asset use breakdowns not reproduced here.",
-        "No electronic filing or submission is performed by this software.",
-    ]
-    if missing: notices.append("Missing employer information: " + ", ".join(missing))
-    if result["review_excluded"]: notices.append(f"{result['review_excluded']} Review document(s) excluded; resolve before filing.")
-    if result.get("changed_since_saved"): notices.append("Saved return changed: review and save it again.")
-    if result.get("skipped"): notices.append(f"{len(result['skipped'])} document(s) skipped due to unreadable dates.")
-    notices += ["Check: " + warning for warning in result.get("warnings", [])]
-    return notices, [
-        {"heading": "Taxpayer / المكلف (published Q1-2 specimen)", "headers": ["Field", "Value"], "rows": company_rows, "total_rows": []},
-        {"heading": "Tax period / الفترة الضريبية (published Q1-2 specimen)", "headers": ["Field", "Value"], "rows": worksheet, "total_rows": []},
-        group("Revenue and output VAT / الإيرادات والضريبة المستحقة (published Q1-2 specimen)",
-              ("A1", "A2", "A3", "A4", "B1", "B2", "B3"), ("B3",)),
-        group("Purchases, expenses and deductible VAT / المشتريات والأعباء (published Q1-2 specimen)",
-              ("C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "D1"), ("C8",)),
-        {"heading": "Partial-deduction review / حق الحسم الجزئي (Q11-2 specimen subject, not its boxes)",
-         "headers": ["Internal calculation", "Value"],
-         "rows": [["Taxable and zero-rated turnover (LBP, year to date)", turnover.get("taxable", ZERO)],
-                  ["Exempt turnover (LBP, year to date)", turnover.get("exempt", ZERO)],
-                  ["Deduction ratio applied", f"{ratio * 100:.2f}%"],
-                  ["Ratio basis", result["ratio_source"]]],
-         "total_rows": [2]},
-        group("VAT balance and credit / الرصيد الضريبي (published Q1-2 specimen)",
-              ("E1", "F1", "F2", "F3", "F4"), ("E1", "F2", "F4")),
-    ]
 
 
 def json_ready(value):

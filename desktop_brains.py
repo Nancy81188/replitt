@@ -3,7 +3,6 @@ Balance des Comptes panel used by both the Trial Balance and the Statement of Ac
 from __future__ import annotations
 
 import os
-import sys
 import tempfile
 import tkinter as tk
 from datetime import datetime
@@ -44,12 +43,11 @@ def currency_from_prefix(value, codes):
 class EditableSheet:
     """A Treeview that edits like a spreadsheet: double-click / Enter to type, Tab / Enter to move on."""
 
-    def __init__(self, app, parent, columns, editable, on_change, on_select=None, height=10, lookup_column=None, lookup_columns=None, lookup_groups=False, choices_by_column=None, selectmode="browse"):
+    def __init__(self, app, parent, columns, editable, on_change, on_select=None, height=10, lookup_column=None):
         self.app = app; self.columns = columns; self.editable = editable; self.on_change = on_change; self.on_select = on_select
-        self.lookup_column = lookup_column; self.lookup_columns = tuple(lookup_columns or ([lookup_column] if lookup_column else []))
-        self.lookup_groups = lookup_groups; self.rows = {}; self.choices_by_column = choices_by_column or {}
+        self.lookup_column = lookup_column; self.rows = {}
         frame = tk.Frame(parent, bg=LIGHT); frame.pack(fill="both", expand=True, padx=10, pady=4)
-        self.tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings", height=height, selectmode=selectmode)
+        self.tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings", height=height, selectmode="browse")
         for key, label, width, anchor in columns: self.tree.heading(key, text=label); self.tree.column(key, width=width, anchor=anchor, stretch=key == "account")
         if any(key in ("department", "project") for key, *_ in columns):
             app._dimension_sheets.append(self)
@@ -62,24 +60,6 @@ class EditableSheet:
         self.tree.bind("<Double-1>", self._clicked); self.tree.bind("<Return>", lambda _e: self.edit(self.tree.focus(), self.editable[0]))
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self.on_select(self.selected()) if self.on_select else None)
         self.tree.bind("<Button-3>", self._right_clicked)  # right-click a cell: open the search for that cell
-        if sys.platform == "darwin": self.tree.bind("<Button-2>", self._right_clicked)
-        if self.lookup_columns: self.tree.bind("<F2>", self._lookup_selected_account)
-
-    def _lookup_selected_account(self, _event=None):
-        iid=self.tree.focus()
-        if iid in self.rows:
-            key=getattr(self,"_focused_key",None)
-            self._lookup_account(iid, key if key in self.lookup_columns else next(iter(self.lookup_columns)))
-        return "break"
-
-    def _lookup_account(self, iid, key):
-        variable=tk.StringVar(value=str(self.rows[iid].get(key, "") or ""))
-        def chosen(*_args):
-            if variable.get() and iid in self.rows and self.on_change(iid, key, variable.get().split(" - ", 1)[0].strip()) is not False:
-                self.refresh(iid)
-        variable.trace_add("write", chosen)
-        if self.lookup_groups: self.app.open_account_lookup(variable, include_groups=True)
-        else: self.app.open_account_lookup(variable)
 
     def _right_clicked(self, event):
         """Right-click on the account cell opens the account search; on an item sheet the item search."""
@@ -90,8 +70,11 @@ class EditableSheet:
         keys = [c[0] for c in self.columns] if visible == ("#all",) else list(visible)
         try: key = keys[int(column.lstrip("#")) - 1]
         except (ValueError, IndexError): key = None
-        if key in self.lookup_columns:
-            self._focused_key=key; self._lookup_account(iid,key); return "break"
+        if key and key == self.lookup_column:
+            variable = tk.StringVar(value=str(self.rows.get(iid, {}).get(key, "") or ""))
+            def chosen(*_args):
+                if variable.get() and iid in self.rows and self.on_change(iid, key, variable.get().split(" - ", 1)[0].strip()) is not False: self.refresh(iid)
+            variable.trace_add("write", chosen); self.app.open_account_lookup(variable); return "break"
         action = getattr(self.tree, "_f2", None)
         if action: action(); return "break"
 
@@ -129,7 +112,6 @@ class EditableSheet:
         visible = self.tree["displaycolumns"]
         keys = [c[0] for c in self.columns] if visible == ("#all",) else list(visible)
         key = keys[int(column.lstrip("#")) - 1]
-        self._focused_key=key
         self.edit(iid, key if key in self.editable else self.editable[0])
 
     def set_dimension_visibility(self, show_department, show_project):
@@ -139,48 +121,30 @@ class EditableSheet:
 
     def edit(self, iid, key):
         if not iid or not self.tree.exists(iid) or not self.tree.winfo_ismapped(): return
-        self._focused_key=key
         index = [c[0] for c in self.columns].index(key); self.tree.see(iid)
-        visible = self.tree["displaycolumns"]
-        displayed = [c[0] for c in self.columns] if visible == ("#all",) else list(visible)
+        displayed = list(self.tree["displaycolumns"])
         if key not in displayed: return
         bbox = self.tree.bbox(iid, f"#{displayed.index(key) + 1}")
-        if not bbox or bbox[0] < 0 or bbox[0] + bbox[2] > self.tree.winfo_width():
-            widths=[self.tree.column(column,"width") for column in displayed]
-            start=sum(widths[:displayed.index(key)])
-            visible=self.tree.winfo_width()
-            target=max(0,start-max(0,visible-widths[displayed.index(key)]))
-            self.tree.xview_moveto(target/max(1,sum(widths)))
-            self.tree.update_idletasks()
-            bbox=self.tree.bbox(iid, f"#{displayed.index(key) + 1}")
         if not bbox: return
         row = self.rows[iid]; value = row.get(key, "")
-        if key in self.choices_by_column:
-            editor = ttk.Combobox(self.tree, values=self.choices_by_column[key], state="readonly")
-        else:
-            editor = tk.Entry(self.tree, justify={"w": "left", "e": "right"}.get(self.columns[index][3], "center"))
+        editor = tk.Entry(self.tree, justify={"w": "left", "e": "right"}.get(self.columns[index][3], "center"))
         editor._saber_date = "date" in key  # date cells (Date From / To, due date...) get their dashes while typing
-        if key in self.choices_by_column: editor.set("" if value is None else str(value))
-        else: editor.insert(0, "" if value is None else str(value))
-        editor.place(x=bbox[0], y=bbox[1], width=max(bbox[2], 70), height=bbox[3])
+        editor.insert(0, "" if value is None else str(value)); editor.place(x=bbox[0], y=bbox[1], width=max(bbox[2], 70), height=bbox[3])
         editor.focus_set(); editor.select_range(0, "end"); done = {"flag": False}
         def commit(move):
             if done["flag"]: return
-            done["flag"] = True; text = editor.get().strip()
-            if iid not in self.rows or not self.tree.exists(iid): editor.destroy(); return
-            if self.on_change(iid, key, text) is False:
-                done["flag"]=False; editor.focus_set(); editor.select_range(0,"end"); return
-            editor.destroy()
+            done["flag"] = True; text = editor.get().strip(); editor.destroy()
+            if iid not in self.rows or not self.tree.exists(iid): return
+            if self.on_change(iid, key, text) is False: return
             self.refresh(iid)
             if move:
-                available = [field for field in self.editable if field in displayed]
+                available = [field for field in self.editable if field in self.tree["displaycolumns"]]
                 position = available.index(key)
                 if position + 1 < len(available): self.app.after(10, lambda: self.edit(iid, available[position + 1]))
                 else:
                     rows = self.tree.get_children(); at = rows.index(iid)
                     if at + 1 < len(rows): self.app.after(10, lambda: self.edit(rows[at + 1], available[0]))
         editor.bind("<Return>", lambda _e: commit(True)); editor.bind("<Tab>", lambda _e: (commit(True), "break")[1])
-        if key in self.choices_by_column: editor.bind("<<ComboboxSelected>>", lambda _e: commit(False))
         editor.bind("<FocusOut>", lambda _e: commit(False)); editor.bind("<Escape>", lambda _e: (done.__setitem__("flag", True), editor.destroy()))
         if key == "line_currency":
             def currency_typed(event):
@@ -190,19 +154,13 @@ class EditableSheet:
                 if matched in self.app.currency_codes:
                     editor.delete(0, "end"); editor.insert(0, matched); commit(True)
             editor.bind("<KeyRelease>", currency_typed)
-        if key in self.lookup_columns:
+        if key == self.lookup_column:
             def lookup(_e=None):
                 variable = tk.StringVar(value=editor.get()); done["flag"] = True; editor.destroy()
                 def chosen(*_args):
                     if variable.get() and self.on_change(iid, key, variable.get().split(" - ", 1)[0].strip()) is not False: self.refresh(iid)
-                variable.trace_add("write", chosen)
-                if self.lookup_groups: self.app.open_account_lookup(variable, include_groups=True)
-                else: self.app.open_account_lookup(variable)
-                return "break"
+                variable.trace_add("write", chosen); self.app.open_account_lookup(variable); return "break"
             editor.bind("<F2>", lookup)
-            editor.bind("<Button-3>", lookup)
-            if sys.platform == "darwin": editor.bind("<Button-2>", lookup)
-            if self.lookup_groups: editor.bind("<Down>", lookup)
 
 
 class BrainsScreensMixin:
@@ -227,14 +185,10 @@ class BrainsScreensMixin:
         header = tk.Frame(page, bg=LIGHT); header.pack(fill="x", padx=10, pady=6)
         self.manual_type = tk.StringVar(value=VOUCHER_TYPES[0]); self.manual_no = tk.StringVar(); self.manual_date = tk.StringVar(value=self.fiscal_today())
         self.manual_currency = tk.StringVar(value="USD"); self.manual_find = tk.StringVar()
-        tk.Label(header, text="Type", bg=LIGHT).pack(side="left")
-        self.manual_type_box=ttk.Combobox(header, textvariable=self.manual_type, values=VOUCHER_TYPES, state="readonly", width=17)
-        self.manual_type_box.pack(side="left", padx=(4, 8))
+        tk.Label(header, text="Type", bg=LIGHT).pack(side="left"); ttk.Combobox(header, textvariable=self.manual_type, values=VOUCHER_TYPES, state="readonly", width=17).pack(side="left", padx=(4, 8))
         tk.Label(header, text="Number", bg=LIGHT).pack(side="left")
-        tk.Entry(header, textvariable=self.manual_no, width=15, state="readonly", takefocus=0, readonlybackground="white", font=("Segoe UI", 10, "bold")).pack(side="left", padx=(4, 8))
-        tk.Label(header, text="Date", bg=LIGHT).pack(side="left")
-        self.manual_date_box=self.date_entry(header, self.manual_date, 12)
-        self.manual_date_box.pack(side="left", padx=(4, 12))
+        tk.Entry(header, textvariable=self.manual_no, width=15, state="readonly", readonlybackground="white", font=("Segoe UI", 10, "bold")).pack(side="left", padx=(4, 8))
+        tk.Label(header, text="Date", bg=LIGHT).pack(side="left"); self.date_entry(header, self.manual_date, 12).pack(side="left", padx=(4, 12))
         tk.Label(header, text="Currency", bg=LIGHT).pack(side="left")
         voucher_currency_box=ttk.Combobox(header, textvariable=self.manual_currency, values=self.currency_codes, state="readonly", width=6)
         voucher_currency_box.pack(side="left", padx=(4, 12))
@@ -244,22 +198,11 @@ class BrainsScreensMixin:
                 if matched in self.currency_codes: self.manual_currency.set(matched)
                 return "break"
         voucher_currency_box.bind("<KeyPress>",select_currency_initial)
-        tk.Label(header, text="Branch", bg=LIGHT).pack(side="left")
-        branch_box=self.branch_selector(header, self.manual_branch, 12, False)
-        branch_box.pack(side="left", padx=(4, 8))
+        tk.Label(header, text="Branch", bg=LIGHT).pack(side="left"); self.branch_selector(header, self.manual_branch, 12, False).pack(side="left", padx=(4, 8))
         tk.Label(header, text="Find", bg=LIGHT).pack(side="left")
         self.manual_find_box = ttk.Combobox(header, textvariable=self.manual_find, width=24); self.manual_find_box.pack(side="left", padx=4)
         self.manual_find_box.bind("<<ComboboxSelected>>", lambda _e: self.open_found_voucher()); self.manual_find_box.bind("<KeyRelease>", self.search_vouchers)
-        def find_or_edit(_event=None):
-            if self.manual_find.get().strip(): self.open_found_voucher()
-            else: self.focus_voucher_entries()
-            return "break"
-        self.manual_find_box.bind("<Return>", find_or_edit)
-        self.manual_find_box.bind("<Tab>", self.focus_voucher_entries)
-        self.manual_type_box.bind("<Return>", lambda _e: (self.manual_date_box.focus_set(), "break")[1])
-        self.manual_date_box.bind("<Return>", lambda _e: (voucher_currency_box.focus_set(), "break")[1], add="+")
-        voucher_currency_box.bind("<Return>", lambda _e: (branch_box.focus_set(), "break")[1])
-        branch_box.bind("<Return>", self.focus_voucher_entries)
+        self.manual_find_box.bind("<Return>", lambda _e: self.open_found_voucher())
         self.manual_currency.trace_add("write", lambda *_a: self.update_manual_totals())
         self.manual_date.trace_add("write", lambda *_a: self.voucher_date_changed())
         columns = [("line", "#", 45, "center"), ("account", "Account No.", 110, "w"), ("description", "Line Detail", 330, "w"), ("line_currency", "Currency", 70, "center"), ("side", "D/C", 45, "center"),
@@ -284,25 +227,12 @@ class BrainsScreensMixin:
         self.manual_line_info.pack(side="bottom", fill="x", padx=10)
         self.voucher_sheet = EditableSheet(self, page, columns, ["account", "description", "line_currency", "side", "amount", "due_date", "reference", "department", "project", "rate_lbp", "rate_usd"],
                                            self.voucher_cell_changed, self.voucher_line_selected, height=6, lookup_column="account")
-        self.voucher_sheet.tree.bind("<Tab>", self.focus_voucher_entries)
         for key in ("rate_lbp","rate_usd"):
             self.voucher_sheet.tree.column(key,width=0,minwidth=0,stretch=False)
         self.voucher_sheet.editable=[key for key in self.voucher_sheet.editable if key not in ("rate_lbp","rate_usd")]
         self.voucher_rates_visible=False
         self.manual_items = []; self.manual_tree = self.voucher_sheet.tree
         self.load_manual_vouchers(); self.new_manual_voucher(confirm=False)
-
-    def focus_voucher_entries(self, _event=None):
-        """Enter the first empty account cell from the voucher header via Tab or Enter."""
-        sheet=self.voucher_sheet
-        rows=sheet.tree.get_children()
-        if not rows or all(sheet.rows[iid].get("account") for iid in rows):
-            self.add_manual_item(edit=False)
-            rows=sheet.tree.get_children()
-        iid=next(iid for iid in rows if not sheet.rows[iid].get("account"))
-        sheet.tree.selection_set(iid); sheet.tree.focus(iid); sheet.tree.see(iid); sheet.tree.focus_set()
-        self.after(20, lambda: sheet.edit(iid,"account"))
-        return "break"
 
     # ---- rates and lines
     def voucher_rates_for(self, currency):
@@ -781,14 +711,10 @@ class BrainsScreensMixin:
         for label, key in (("Account From", "account_from"), ("Account To", "account_to")):
             line = tk.Frame(rows_box, bg=LIGHT); line.pack(fill="x", pady=1)
             tk.Label(line, text=label, bg=LIGHT, width=12, anchor="w", font=("Segoe UI", 9, "bold")).pack(side="left")
-            account_box=self.account_range_box(line, v[key], v.setdefault(f"{key}_name", tk.StringVar()))
-            account_box.pack(side="left", padx=(4, 6)); v[f"{key}_box"]=account_box
+            self.account_range_box(line, v[key], v.setdefault(f"{key}_name", tk.StringVar())).pack(side="left", padx=(4, 6))
             tk.Label(line, textvariable=v[f"{key}_name"], bg="#dfe6ee", fg=NAVY, width=46, anchor="w", padx=6).pack(side="left")
             if key == "account_from":
                 tk.Button(line, text="Same as From  >", command=lambda: v["account_to"].set(v["account_from"].get()), bg=NAVY, fg="white", border=0, padx=8).pack(side="left", padx=8)
-        if statement:
-            v["_auto_account_to"]=None
-            v["account_from"].trace_add("write",lambda *_args:self.statement_account_from_changed(v))
 
         row1 = tk.Frame(box, bg=LIGHT); row1.pack(fill="x", pady=(4, 0))
         tk.Label(row1, text="Date From", bg=LIGHT).pack(side="left"); self.date_entry(row1, v["date_from"], 11).pack(side="left", padx=(4, 8))
@@ -833,35 +759,24 @@ class BrainsScreensMixin:
         if not getattr(self, "_all_accounts", None):
             try: self._all_accounts = {str(a["code"]): a["name_en"] for a in self.client.accounts()}
             except Exception: self._all_accounts = {}
-        def choices(): return [f"{code} - {name}" for code, name in sorted(self._all_accounts.items())]
-        box = ttk.Combobox(parent, textvariable=variable, values=choices(), width=16)
+        choices = [f"{code} - {name}" for code, name in sorted(self._all_accounts.items())]
+        box = ttk.Combobox(parent, textvariable=variable, values=choices, width=16)
         def show_name(*_args):
             code = variable.get().split(" - ", 1)[0].strip()
             name_variable.set(self._all_accounts.get(code, "" if not code else "(account not found)"))
         def search(event=None):
             if event is not None and event.keysym in ("Up", "Down", "Return", "Escape", "Tab"): return
             typed = variable.get().strip().casefold()
-            available=choices()
-            box["values"] = [c for c in available if typed in c.casefold()] if typed else available
+            box["values"] = [c for c in choices if typed in c.casefold()] if typed else choices
             show_name()
         def choose(_event=None):
             value = variable.get()
             if " - " in value: variable.set(value.split(" - ", 1)[0].strip())
             show_name()
-        box.bind("<KeyRelease>", search); box.bind("<FocusIn>", search)
-        box.bind("<<ComboboxSelected>>", choose); box.bind("<FocusOut>", choose); box.bind("<Return>", choose)
+        box.bind("<KeyRelease>", search); box.bind("<<ComboboxSelected>>", choose); box.bind("<FocusOut>", choose); box.bind("<Return>", choose)
         box._f2 = lambda: (self.open_account_lookup(variable), None)[1]
         variable.trace_add("write", show_name); show_name()
         return box
-
-    def statement_account_from_changed(self, v):
-        """Mirror a known account to the second row unless the user chose a different end account."""
-        code=v["account_from"].get().split(" - ",1)[0].strip()
-        if code not in getattr(self,"_all_accounts",{}): return
-        current=v["account_to"].get().split(" - ",1)[0].strip()
-        if not current or current==v.get("_auto_account_to"):
-            v["_auto_account_to"]=code
-            v["account_to"].set(code)
 
     def new_result_tab(self, state, title):
         frame = tk.Frame(state["notebook"], bg=LIGHT); state["notebook"].add(frame, text=f"  {title[:34]}  ")
@@ -944,10 +859,7 @@ class BrainsScreensMixin:
 
     def balance_party_chosen(self, v):
         party = getattr(self, "balance_party_map", {}).get(v["party"].get())
-        if party and party.get("account_number"):
-            code=party["account_number"]
-            v["account_from"].set(code); v["account_to"].set(code)
-            if "_auto_account_to" in v: v["_auto_account_to"]=code
+        if party and party.get("account_number"): v["account_from"].set(party["account_number"]); v["account_to"].set(party["account_number"])
 
     def balance_options(self, state):
         v, flags = state["vars"], state["flags"]
@@ -1006,17 +918,6 @@ class BrainsScreensMixin:
     def build_statement(self):
         self.statement_state = self.build_balance_panel(self.statement_tab, statement=True)
         self.load_statement_parties()
-        if not getattr(self,"_statement_escape_bound",False):
-            self.bind("<Escape>",self.statement_escape,add="+")
-            self._statement_escape_bound=True
-
-    def statement_escape(self,event):
-        widget=event.widget
-        while widget is not None:
-            if widget is self.statement_tab:
-                self.show_tab_window(0,0)
-                return "break"
-            widget=getattr(widget,"master",None)
 
     def load_statement_parties(self):
         state = getattr(self, "statement_state", None)

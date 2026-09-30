@@ -1,9 +1,8 @@
 """Straight-line fixed asset register and auditable depreciation postings."""
 import calendar
-import hashlib
 import json
 from decimal import ROUND_CEILING
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 
@@ -21,12 +20,6 @@ def migrate(db):
             id INTEGER PRIMARY KEY, asset_id INTEGER NOT NULL REFERENCES fixed_assets(id),
             period_end TEXT NOT NULL, amount TEXT NOT NULL, entry_id INTEGER REFERENCES journal_entries(id),
             UNIQUE(asset_id, period_end)
-        );
-        CREATE TABLE IF NOT EXISTS fixed_asset_attachments (
-            id INTEGER PRIMARY KEY, asset_id INTEGER NOT NULL REFERENCES fixed_assets(id) ON DELETE CASCADE,
-            file_name TEXT NOT NULL, mime_type TEXT NOT NULL, content BLOB NOT NULL,
-            sha256 TEXT NOT NULL, uploaded_by INTEGER REFERENCES users(id), uploaded_at TEXT NOT NULL,
-            UNIQUE(asset_id, sha256)
         );
     """)
     if "annual_rate" not in {row[1] for row in db.execute("PRAGMA table_info(fixed_assets)")}:
@@ -49,55 +42,7 @@ def _money(value, label):
 
 def list_assets(database):
     with database.connect() as db:
-        return [dict(row) for row in db.execute("""SELECT a.*,
-            (SELECT COUNT(*) FROM fixed_asset_attachments x WHERE x.asset_id=a.id) attachment_count
-            FROM fixed_assets a WHERE a.status='active' ORDER BY a.asset_code""")]
-
-
-def add_attachment(database, asset_id, file_name, mime_type, content, user_id=None):
-    """Attach a PDF once per asset/content hash; retrying an uncertain upload is safe."""
-    name=str(file_name or "").replace("\\","/").rsplit("/",1)[-1].strip()
-    if not name or not name.lower().endswith(".pdf") or not content:
-        raise ValueError("Choose a non-empty PDF attachment")
-    if len(content)>15*1024*1024:
-        raise ValueError("Asset PDF attachment cannot exceed 15 MB")
-    if not bytes(content).startswith(b"%PDF-"):
-        raise ValueError("The selected file is not a valid PDF")
-    digest=hashlib.sha256(content).hexdigest()
-    uploaded_at=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
-    with database.connect() as db:
-        asset=db.execute("SELECT id FROM fixed_assets WHERE id=? AND status='active'",(int(asset_id),)).fetchone()
-        if not asset: raise KeyError(asset_id)
-        prior=db.execute("SELECT id,file_name FROM fixed_asset_attachments WHERE asset_id=? AND sha256=?",
-                         (int(asset_id),digest)).fetchone()
-        if prior:
-            return {"attachment_id":prior["id"],"duplicate":True,"sha256":digest,"file_name":prior["file_name"]}
-        inserted=db.execute("""INSERT OR IGNORE INTO fixed_asset_attachments
-            (asset_id,file_name,mime_type,content,sha256,uploaded_by,uploaded_at) VALUES(?,?,?,?,?,?,?)""",
-            (int(asset_id),name,"application/pdf",bytes(content),digest,user_id,uploaded_at))
-        row=db.execute("SELECT id,file_name FROM fixed_asset_attachments WHERE asset_id=? AND sha256=?",
-                       (int(asset_id),digest)).fetchone()
-        if not inserted.rowcount:
-            return {"attachment_id":row["id"],"duplicate":True,"sha256":digest,"file_name":row["file_name"]}
-        db.execute("INSERT INTO audit_log(user_id,action,entity,entity_id,details,created_at) VALUES(?,?,?,?,?,?)",
-                   (user_id,"attach","fixed_asset",int(asset_id),json.dumps({"file_name":name,"sha256":digest}),uploaded_at))
-        return {"attachment_id":row["id"],"duplicate":False,"sha256":digest,"file_name":name}
-
-
-def list_attachments(database, asset_id):
-    with database.connect() as db:
-        if not db.execute("SELECT 1 FROM fixed_assets WHERE id=? AND status='active'",(int(asset_id),)).fetchone():
-            raise KeyError(asset_id)
-        return [dict(row) for row in db.execute("""SELECT id,asset_id,file_name,mime_type,length(content) size,
-            sha256,uploaded_at FROM fixed_asset_attachments WHERE asset_id=? ORDER BY id DESC""",(int(asset_id),))]
-
-
-def get_attachment(database, attachment_id):
-    with database.connect() as db:
-        row=db.execute("""SELECT x.* FROM fixed_asset_attachments x JOIN fixed_assets a ON a.id=x.asset_id
-            WHERE x.id=? AND a.status='active'""",(int(attachment_id),)).fetchone()
-        if not row: raise KeyError(attachment_id)
-        return dict(row)
+        return [dict(row) for row in db.execute("SELECT * FROM fixed_assets WHERE status='active' ORDER BY asset_code")]
 
 
 def save_asset(database, payload, asset_id=None, user_id=None):
@@ -154,12 +99,7 @@ def schedule(database, asset_id):
     with database.connect() as db:
         asset=db.execute("SELECT * FROM fixed_assets WHERE id=? AND status='active'",(asset_id,)).fetchone()
         if not asset: raise KeyError(asset_id)
-        asset=dict(asset)
         postings={row["period_end"]:dict(row) for row in db.execute("SELECT * FROM fixed_asset_postings WHERE asset_id=?",(asset_id,))}
-    return _schedule_rows(asset,postings)
-
-
-def _schedule_rows(asset,postings):
     depreciable=Decimal(asset["cost"])-Decimal(asset["residual"]); months=asset["useful_months"]
     start=date.fromisoformat(asset["start_on"]); amounts=[]; assigned=Decimal("0")
     for index in range(months):
@@ -184,53 +124,6 @@ def _schedule_rows(asset,postings):
         rows.append({"period_end":end,"amount":str(amount),"accumulated":str(accumulated),"net_book_value":str(Decimal(asset["cost"])-accumulated),
                      "posted":end in postings,"entry_id":postings.get(end,{}).get("entry_id")})
     return rows
-
-
-def rollforward(database, fiscal_year):
-    """Read-only, per-currency fixed-asset cost and depreciation rollforward."""
-    try: year=int(fiscal_year)
-    except (TypeError,ValueError): raise ValueError("Enter a valid fiscal year")
-    if year<2000 or year>2100: raise ValueError("Enter a valid fiscal year")
-    start=f"{year:04d}-01-01"; end=f"{year:04d}-12-31"
-    with database.connect() as db:
-        assets=[dict(row) for row in db.execute(
-            "SELECT * FROM fixed_assets WHERE status='active' AND acquired_on<=? ORDER BY asset_code",(end,))]
-        posting_rows=[dict(row) for row in db.execute(
-            """SELECT p.* FROM fixed_asset_postings p JOIN fixed_assets a ON a.id=p.asset_id
-               WHERE a.status='active' AND a.acquired_on<=? AND p.period_end<=? ORDER BY p.asset_id,p.period_end""",(end,end))]
-    postings={}
-    for row in posting_rows: postings.setdefault(row["asset_id"],{})[row["period_end"]]=row
-    money_fields=("opening_cost","additions","closing_cost","opening_accumulated","depreciation_posted",
-                  "closing_accumulated","opening_net_book_value","closing_net_book_value","unposted_scheduled")
-    totals={}
-    items=[]
-    for asset in assets:
-        cost=Decimal(asset["cost"]); acquired=asset["acquired_on"]
-        opening_cost=cost if acquired<start else Decimal("0")
-        additions=cost if start<=acquired<=end else Decimal("0")
-        opening_accumulated=Decimal("0"); depreciation=Decimal("0"); unposted=Decimal("0")
-        asset_postings=postings.get(asset["id"],{})
-        for period,posting in asset_postings.items():
-            amount=Decimal(posting["amount"])
-            if period<start: opening_accumulated+=amount
-            else: depreciation+=amount
-        for period in _schedule_rows(asset,asset_postings):
-            if start<=period["period_end"]<=end and not period["posted"]:
-                unposted+=Decimal(period["amount"])
-        closing_cost=opening_cost+additions
-        closing_accumulated=opening_accumulated+depreciation
-        row={"asset_code":asset["asset_code"],"name":asset["name"],"currency":asset["currency"],
-             "opening_cost":opening_cost,"additions":additions,"closing_cost":closing_cost,
-             "opening_accumulated":opening_accumulated,"depreciation_posted":depreciation,
-             "closing_accumulated":closing_accumulated,"opening_net_book_value":opening_cost-opening_accumulated,
-             "closing_net_book_value":closing_cost-closing_accumulated,"unposted_scheduled":unposted}
-        items.append({key:(str(value.quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)) if isinstance(value,Decimal) else value)
-                      for key,value in row.items()})
-        currency_totals=totals.setdefault(asset["currency"],{field:Decimal("0") for field in money_fields})
-        for field in money_fields: currency_totals[field]+=row[field]
-    return {"year":year,"items":items,"totals":{
-        currency:{field:str(value.quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)) for field,value in amounts.items()}
-        for currency,amounts in sorted(totals.items())}}
 
 
 def post_period(database, asset_id, period_end, user_id, fiscal_year=None):
@@ -281,20 +174,11 @@ def carry_forward(source, target, target_year):
     assets=check_carry_forward(source,target_year)
     with target.connect() as db:
         for asset in assets:
-            with source.connect() as source_db:
-                attachments=[dict(row) for row in source_db.execute(
-                    "SELECT file_name,mime_type,content,sha256,uploaded_by,uploaded_at FROM fixed_asset_attachments WHERE asset_id=?",
-                    (asset["id"],))]
             values=(asset["asset_code"],asset["name"],asset["acquired_on"],asset["start_on"],asset["currency"],
                     asset["cost"],asset["residual"],asset["useful_months"],asset["frequency"],asset["asset_account"],
                     asset["depreciation_account"],asset["accumulated_account"],None,asset["annual_rate"],asset["created_at"])
             new_id=db.execute("""INSERT INTO fixed_assets(asset_code,name,acquired_on,start_on,currency,cost,residual,useful_months,frequency,
                 asset_account,depreciation_account,accumulated_account,invoice_id,annual_rate,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",values).lastrowid
-            for attachment in attachments:
-                db.execute("""INSERT OR IGNORE INTO fixed_asset_attachments
-                    (asset_id,file_name,mime_type,content,sha256,uploaded_by,uploaded_at) VALUES(?,?,?,?,?,?,?)""",
-                    (new_id,attachment["file_name"],attachment["mime_type"],attachment["content"],attachment["sha256"],
-                     attachment["uploaded_by"],attachment["uploaded_at"]))
             for row in schedule(source,asset["id"]):
                 if row["posted"] and row["period_end"][:4]<str(target_year):
                     db.execute("INSERT INTO fixed_asset_postings(asset_id,period_end,amount,entry_id) VALUES(?,?,?,NULL)",

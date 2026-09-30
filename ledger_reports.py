@@ -61,7 +61,6 @@ def _load_lines(db, options):
     currencies = [c.upper() for c in (options.get("currencies") or []) if c]
     bilan = _truthy(options.get("balance_sheet_only", False)); result = _truthy(options.get("profit_loss_only", False))
     kept = []; rate_cache = {}
-    requested = {options.get("first_column", "account"), options.get("second_column", "LBP")}
     for row in rows:
         try: row["iso_date"] = iso_date(row["entry_date"])
         except ValueError: continue
@@ -79,23 +78,17 @@ def _load_lines(db, options):
         if row.get("line_currency") and row.get("amount") not in (None, ""):
             sign = 1 if signed >= 0 else -1
             row["signed"]["account"] = Decimal(str(row["amount"])) * sign
-            for target in ("LBP", "USD"):
-                equivalent = row.get(f"amount_{target.lower()}")
-                row["signed"][target] = (
-                    Decimal(str(equivalent)) * sign if equivalent not in (None, "")
-                    else row["signed"]["account"] if row["account_currency"] == target
-                    else None
-                )
+            row["signed"]["LBP"] = Decimal(str(row["amount_lbp"] or 0)) * sign
+            row["signed"]["USD"] = Decimal(str(row["amount_usd"] or 0)) * sign
         else:
             row["signed"]["account"] = signed
             for target in ("LBP", "USD"):
                 if row["currency"] == target: row["signed"][target] = signed; continue
-                if signed == ZERO: row["signed"][target] = ZERO; continue
                 key = (row["currency"], target, row["iso_date"])
                 if key not in rate_cache:
                     try: rate_cache[key] = db._converted_amount(Decimal("1"), row["currency"], target, row["iso_date"])
                     except ValueError: rate_cache[key] = None
-                row["signed"][target] = signed * rate_cache[key] if rate_cache[key] is not None else None
+                row["signed"][target] = signed * rate_cache[key] if rate_cache[key] is not None else ZERO
         for target in (options.get("first_column"),options.get("second_column")):
             if target in (None,"account","LBP","USD","none") or target in row["signed"]: continue
             if row["account_currency"] == target:
@@ -107,12 +100,6 @@ def _load_lines(db, options):
                 if key not in rate_cache:
                     rate_cache[key]=db._converted_amount(Decimal("1"),row["account_currency"],target,row["iso_date"])
                 row["signed"][target]=row["signed"]["account"]*rate_cache[key]
-        for target in requested & {"LBP", "USD"}:
-            if row["signed"][target] is None:
-                raise ValueError(
-                    f"Missing {target} equivalent or exchange rate for entry {row['entry_number']} "
-                    f"dated {display_date(row['iso_date'])}; cannot produce an accurate report"
-                )
         row["due"] = row.get("due_date") or row.get("invoice_due_date") or ""
         row["ref"] = row.get("reference") or (row.get("invoice_number") if row.get("invoice_number") and row["invoice_number"] != row["entry_number"] else "") or ""
         kept.append(row)

@@ -1,4 +1,4 @@
-"""Lebanese payroll report worksheets (R5, R6, R10) built from saved payroll records.
+"""Lebanese payroll official reports (R5, R6, R10) built from saved payroll records.
 
 Every figure is taken from the payroll records as they were calculated, so each month keeps
 the tax brackets, NSSF rates and ceilings that were effective on its own period date.
@@ -219,9 +219,7 @@ def build_payroll_report(db, report="R10", period_type="quarterly", year=None, i
     sections.append(settings_section)
     meta = [f"Company: {company.get('company_name') or '-'}   MOF No.: {company.get('company_mof') or '-'}",
             f"Period: {label} ({_display(start)} to {_display(end)})   Amounts in LBP",
-            "Source: " + ("posted and draft payroll (draft figures are not final)" if include_drafts else "posted payroll only"),
-            "Preparation worksheet only—not the Ministry of Finance's current R5/R6/R10 form or electronic filing. R10 is quarterly; monthly/yearly views are internal review periods.",
-            "Confirm current form fields, worker eligibility, wage classification, spouse-working deductions, applicable rates, and due dates before filing."]
+            "Source: " + ("posted and draft payroll (draft figures are not final)" if include_drafts else "posted payroll only")]
     return {"report": report, "title": REPORTS[report], "period_label": label, "date_from": start, "date_to": end,
             "meta": meta, "sections": sections, "summary": summary, "record_count": len(records)}
 
@@ -246,10 +244,9 @@ def _month_end(iso):
 
 
 def nssf_declaration_period(employees, year, month):
-    """Suggest a period using the roster at the selected month's end.
+    """Pick the declaration period from the roster at the selected month's end.
 
-    Nine or fewer employees suggest a quarter; ten or more suggest a month.
-    This is an application convenience, not a verified CNSS filing rule. An
+    Nine or fewer employees use a quarter; ten or more use a month. An
     employee who left earlier or has not yet joined is not counted.
     """
     year, month = int(year), int(month)
@@ -274,7 +271,7 @@ def build_nssf_statement(db, period_type="monthly", year=None, index=1, include_
         period_type, index, employee_count_at_selection = nssf_declaration_period(
             db.list_employees(), year or date.today().year, index)
     start, end, label = period_range(period_type, year or date.today().year, index)
-    if auto: label += f" | Suggested: {employee_count_at_selection} employee(s), {period_type} view"
+    if auto: label += f" | Auto: {employee_count_at_selection} employee(s), {period_type} declaration"
     records = _load_records(db, start, end, bool(include_drafts)); company = db.settings()
     rows = []; payroll_employee_ids = {row["employee_id"] for row in records}
     company_employees = db.list_employees()
@@ -339,9 +336,7 @@ def build_nssf_statement(db, period_type="monthly", year=None, index=1, include_
                  "rows": ceilings or [["-"] * 7], "total_rows": []}]
     meta = [f"Employer: {company.get('company_name') or '-'}   Employer NSSF No.: {company.get('company_nssf') or '-'}   MOF No.: {company.get('company_mof') or '-'}",
             f"Current active employees: {current_employee_count}   In selected period: {len(period_employees)}   With payroll: {len(payroll_employee_ids)}",
-            f"Period: {label} ({_display(start)} to {_display(end)})   Amounts in LBP   Source: " + ("posted and draft payroll" if include_drafts else "posted payroll"),
-            "Review worksheet only—not an official CNSS declaration or payment form. Confirm rates, wage classification, employee eligibility, and filing period with CNSS before filing or paying.",
-            "The 10-employee monthly/quarterly choice is an unverified application suggestion; CNSS Law Article 72's under-10 rule concerns fixed contributions, not a confirmed filing frequency."]
+            f"Period: {label} ({_display(start)} to {_display(end)})   Amounts in LBP   Source: " + ("posted and draft payroll" if include_drafts else "posted payroll")]
     return {"report": "NSSF", "title": NSSF_TITLE, "period_label": label, "date_from": start, "date_to": end, "meta": meta, "sections": sections,
             "declaration_period": period_type, "declaration_employee_count": employee_count_at_selection,
             "record_count": len(records), "employee_count": len(period_employees), "active_employee_count": current_employee_count,

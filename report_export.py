@@ -362,23 +362,13 @@ def export_sections_excel(path, title, meta, sections):
         ws.row_dimensions[row].height = 30; row += 1
         totals = set(section.get("total_rows") or [])
         for index, values in enumerate(section["rows"]):
-            if len(values) > len(section["headers"]):
-                raise ValueError(f"Section {section['heading']!r} has more values than headers")
-            height = 15
             for column, value in enumerate(values, 1):
                 c = ws.cell(row, column, _plain(value))
                 if isinstance(c.value, (int, float)) and not isinstance(c.value, bool):
                     c.number_format = "#,##0.00" if isinstance(c.value, float) and abs(c.value - round(c.value)) > 1e-9 else "#,##0"
                     c.alignment = Alignment(horizontal="right")
-                else:
-                    c.alignment = Alignment(vertical="top", wrap_text=True)
-                    # Excel otherwise hides the rest of long notes behind the next column.
-                    lines = str(c.value or "").splitlines() or [""]
-                    cell_width = min(65, max(widths.get(column, 10), len(_formatted(value)) + 2))
-                    height = max(height, 15 * sum(max(1, (len(line) + int(cell_width) - 1) // int(cell_width)) for line in lines))
                 if index in totals: c.font = Font(bold=True); c.fill = total_fill
-                widths[column] = max(widths.get(column, 10), min(65, len(_formatted(value)) + 2))
-            ws.row_dimensions[row].height = min(400, height)
+                widths[column] = max(widths.get(column, 10), min(45, len(_formatted(value)) + 2))
             row += 1
     for column, value in widths.items(): ws.column_dimensions[get_column_letter(column)].width = value
     ws.sheet_view.showGridLines = True
@@ -397,13 +387,12 @@ def export_sections_pdf(path, title, meta, sections):
         for style in styles.byName.values(): style.fontName = regular
         for key in ("Title", "Heading1", "Heading2", "Heading3"): styles[key].fontName = bold_font
         styles["Normal"].fontSize=11; styles["Normal"].leading=15
-    header_style = ParagraphStyle("header", parent=styles["Normal"], fontName=bold_font, fontSize=10 if financial else 8, leading=13 if financial else 10, textColor=colors.white, alignment=1)
-    cell_style = ParagraphStyle("cell", parent=styles["Normal"], fontSize=10 if financial else 8, leading=13 if financial else 10)
+    header_style = ParagraphStyle("header", parent=styles["Normal"], fontName=bold_font, fontSize=10 if financial else 6.5, leading=13 if financial else 7.5, textColor=colors.white, alignment=1)
+    cell_style = ParagraphStyle("cell", parent=styles["Normal"], fontSize=10 if financial else 6.5, leading=13 if financial else 7.5)
     story = [pdf_paragraph(title, styles["Title"], True)]
     for line in list(meta or []) + [f"Generated: {datetime.now():%d-%m-%Y %H:%M}"]: story.append(pdf_paragraph(line, styles["Normal"]))
     story.append(Spacer(1, 4*mm))
-    # ReportLab frames add 6pt padding on each side of doc.width.
-    available = doc.width - 12
+    available = page[0] - 16*mm
     for section in sections:
         if financial and (section["heading"].startswith(("Statement of", "Notes: account")) or section["heading"].endswith("DRAFT - Addressee")):
             from reportlab.platypus import PageBreak
@@ -417,58 +406,36 @@ def export_sections_pdf(path, title, meta, sections):
             story.append(Spacer(1, 3*mm))
             continue
         headers = section["headers"]; count = len(headers)
-        if not count:
-            continue
         body = [[_formatted(value) for value in list(values) + [""] * (count - len(values))] for values in section["rows"]]
-        if any(len(row) > count for row in body):
-            raise ValueError(f"Section {section['heading']!r} has more values than headers")
-        def preferred_width(column):
-            header = max((len(part.strip()) for part in str(headers[column]).split(" | ")), default=0)
-            longest = max([header] + [len(row[column]) for row in body])
-            numeric = all(not row[column] or row[column].replace(",", "").replace(".", "").lstrip("-").isdigit() for row in body)
-            return min(65*mm, max((20 if numeric else 29)*mm, longest * (4.5 if numeric else 4)))
-        widths = [preferred_width(i) for i in range(count)]
+        weights = []
+        def header_length(text):
+            parts = [p.strip() for p in str(text).split(" | ")]
+            return max(len(p) * (0.8 if has_arabic(p) else 1) for p in parts) * (0.75 if len(parts) > 1 else 1)
+        for column in range(count):
+            longest = max([header_length(headers[column])] + [len(row[column]) * (1.15 if has_arabic(row[column]) else 1) for row in body] or [6])
+            weights.append(min(max(longest, 7), 30))
         if financial and count == 5:
             weights = [13, 24, 29, 20, 23] if headers[0] == "Account" else [35, 16, 23, 16, 16]
-            widths = [weight * available / sum(weights) for weight in weights]
-        # Keep a readable minimum font and column width rather than shrinking the whole table.
-        # Wide sections are divided into consecutive bands, repeating the identifying first column.
-        bands = []
-        if sum(widths) <= available:
-            bands = [list(range(count))]
-        else:
-            current = [0]
-            for column in range(1, count):
-                if len(current) > 1 and sum(widths[i] for i in current) + widths[column] > available:
-                    bands.append(current)
-                    current = [0]
-                current.append(column)
-            bands.append(current)
-        # A single exceptionally wide cell must still fit in the page frame.
-        widths = [min(width, available - (widths[0] if i else 0) - 1) if i else min(width, available * .45)
-                  for i, width in enumerate(widths)] if len(bands) > 1 else [min(width, available) for width in widths]
+        scale = available / sum(weights); col_widths = [w * scale for w in weights]
         def header_cell(text):
             parts = [p.strip() for p in str(text).split(" | ")]
             if len(parts) == 1: return pdf_paragraph(parts[0], header_style, True)
             return [pdf_paragraph(p, header_style, True) for p in parts]  # English above, Arabic below
-        for band in bands:
-            if len(bands) > 1:
-                story.append(pdf_paragraph(f"Columns {band[1] + 1}–{band[-1] + 1} of {count} (first column repeated)", styles["Normal"]))
-            data = [[header_cell(headers[i]) for i in band]]
-            for row in body:
-                data.append([pdf_paragraph(row[i], cell_style) for i in band])
-            table = Table(data, repeatRows=1, splitInRow=1, colWidths=[widths[i] for i in band])
-            style = [("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#071B2E")),
-                     ("GRID", (0, 0), (-1, -1), .25, colors.grey), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                     ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F3F6F8")]),
-                     ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]
-            for position, column in enumerate(band):
-                if any(value and value.replace(",", "").replace(".", "").lstrip("-").isdigit() for value in (row[column] for row in body)):
-                    style.append(("ALIGN", (position, 1), (position, -1), "RIGHT"))
-            for index in section.get("total_rows") or []:
-                if 0 <= index < len(body):
-                    style += [("BACKGROUND", (0, index + 1), (-1, index + 1), colors.HexColor("#E8EDF2"))]
-            table.setStyle(TableStyle(style)); story += [table, Spacer(1, 5*mm)]
+        data = [[header_cell(h) for h in headers]]
+        for row in body:
+            data.append([pdf_paragraph(value, cell_style) if has_arabic(value) or (len(value) > 18 and not value.replace(",", "").replace(".", "").replace("-", "").isdigit()) else value for value in row])
+        table = Table(data, repeatRows=1, colWidths=col_widths)
+        style = [("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#071B2E")), ("FONTNAME", (0, 1), (-1, -1), regular), ("FONTSIZE", (0, 1), (-1, -1), 10 if financial else 6.5),
+                 ("GRID", (0, 0), (-1, -1), .25, colors.grey), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F3F6F8")]),
+                 ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]
+        for column in range(count):
+            if any(value and value.replace(",", "").replace(".", "").lstrip("-").isdigit() for value in (row[column] for row in body)):
+                style.append(("ALIGN", (column, 1), (column, -1), "RIGHT"))
+        for index in section.get("total_rows") or []:
+            if 0 <= index < len(body):
+                style += [("FONTNAME", (0, index + 1), (-1, index + 1), bold_font), ("BACKGROUND", (0, index + 1), (-1, index + 1), colors.HexColor("#E8EDF2"))]
+        table.setStyle(TableStyle(style)); story += [table, Spacer(1, 5*mm)]
 
     def footer(canvas, document):
         canvas.saveState(); canvas.setFont(regular, 7); canvas.setFillColor(colors.HexColor("#5F6B76"))
