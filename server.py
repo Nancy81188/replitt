@@ -104,6 +104,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         if path == "/api/me":
             info={k:user[k] for k in ("id","username","role","language","expires_at")}; info["permissions"]={m:self.master_db.user_can(user,m) for m in ("payroll","vat")}
             return self._json(200,info)
+        if path == "/api/asset-categories": return self._json(200,{"items":fixed_assets.list_categories(self.db)})
+        if path == "/api/asset-depreciation":
+            try: return self._json(200,ledger_reports.json_ready(fixed_assets.monthly_table(self.db,self._query(parsed,"month"),self._query(parsed,"account") or None)))
+            except Exception as exc: return self._json(400,{"error":str(exc)})
         if path == "/api/fixed-assets":
             return self._json(200,{"items":fixed_assets.list_assets(self.db)})
         if path.startswith("/api/fixed-assets/") and path.endswith("/schedule"):
@@ -430,6 +434,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 import financial_statements
                 target = self.company_manager.database(self.headers.get("X-Company-ID"),int(body["year"]))
                 return self._json(200,financial_statements.save_config(target,body["config"],user["id"]))
+            except Exception as exc: return self._json(400,{"error":str(exc)})
+        if path == "/api/asset-categories":
+            try:
+                if body.get("delete"): return self._json(200,{"items":fixed_assets.delete_category(self.db,body.get("account_code"))})
+                return self._json(200,{"items":fixed_assets.save_category(self.db,body,user["id"])})
+            except Exception as exc: return self._json(400,{"error":str(exc)})
+        if path == "/api/asset-depreciation/post":
+            try: return self._json(201,fixed_assets.post_category_month(self.db,body.get("account_code"),body.get("month"),user["id"],getattr(self.db,"fiscal_year",None)))
             except Exception as exc: return self._json(400,{"error":str(exc)})
         if path == "/api/fixed-assets":
             try: return self._json(201,{"asset":fixed_assets.save_asset(self.db,body,user_id=user["id"])})
@@ -849,7 +861,7 @@ def run_server(host="127.0.0.1", port=8765, database="saber_accounting.db", admi
         raise ValueError("Shared network access requires --tls-cert and --tls-key (or explicit --allow-insecure-lan for a trusted VPN)")
     admin_password = admin_password or os.environ.get("SABER_ADMIN_PASSWORD") or secrets.token_urlsafe(12)
     db = Database(database, pooled=True)
-    db.initialize(admin_password)
+    db.initialize_if_needed(admin_password)
     ApiHandler.db = db; ApiHandler.master_db=db; ApiHandler.company_manager=CompanyManager(database, pooled=True)
     # Company data lives in companies/<Company Name>/<Company Name>_<year>.db (moved there once, safely).
     try:

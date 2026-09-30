@@ -4,6 +4,7 @@ large-database slowness returns.
 """
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from database import Database
@@ -29,6 +30,40 @@ class PerformanceTuningTests(unittest.TestCase):
         db = Database(Path(folder) / "perf.db")
         db.initialize("secret")
         return db
+
+    def test_current_database_startup_does_not_reseed_or_scan(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "perf.db"
+            db = Database(path)
+            db.initialize_if_needed("original-password")
+            with db.connect() as conn:
+                conn.execute("UPDATE accounts SET name_en='My custom label' WHERE code='6011'")
+            reopened = Database(path)
+            with mock.patch.object(reopened, "initialize", side_effect=AssertionError("unnecessary migration")):
+                reopened.initialize_if_needed("different-password")
+            with reopened.connect() as conn:
+                self.assertEqual(conn.execute("SELECT name_en FROM accounts WHERE code='6011'").fetchone()[0], "My custom label")
+
+    def test_older_or_unmarked_database_is_upgraded(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = self._fresh_db(folder)
+            for marker in (None, "older"):
+                with db.connect() as conn:
+                    conn.execute("DELETE FROM app_settings WHERE key='startup_schema_version'")
+                    if marker:
+                        conn.execute("INSERT INTO app_settings(key,value) VALUES('startup_schema_version',?)", (marker,))
+                with mock.patch.object(db, "initialize", wraps=db.initialize) as upgrade:
+                    db.initialize_if_needed("secret")
+                    upgrade.assert_called_once_with("secret")
+
+    def test_failed_upgrade_is_retried(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "perf.db")
+            with mock.patch.object(db, "_auto_lebanese_payroll_rules", side_effect=RuntimeError("interrupted")):
+                with self.assertRaises(RuntimeError): db.initialize_if_needed("secret")
+            with mock.patch.object(db, "initialize", wraps=db.initialize) as upgrade:
+                db.initialize_if_needed("secret")
+                upgrade.assert_called_once()
 
     def test_expected_indexes_exist(self):
         with tempfile.TemporaryDirectory() as folder:

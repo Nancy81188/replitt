@@ -339,6 +339,31 @@ class Database:
                 self._transaction.connection = None
                 if not self.pooled: connection.close()
 
+    # Bump whenever initialize(), SCHEMA, seed accounts or its migration helpers change.
+    STARTUP_SCHEMA_VERSION = "1"
+
+    @staticmethod
+    def _startup_schema_signature(db):
+        # Metadata only: no invoice, journal or other business rows are scanned.
+        rows = db.execute("SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").fetchall()
+        return hashlib.sha256(json.dumps([tuple(row) for row in rows]).encode("utf-8")).hexdigest()
+
+    def initialize_if_needed(self, admin_password):
+        """Prepare a file once per schema revision, including restored older files.
+
+        The marker lives in the database, not process memory. Failed migrations never
+        stamp it. Explicit initialize() remains available for full repair/reseeding.
+        """
+        with self._lock:
+            with self.connect() as db:
+                table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_settings'").fetchone()
+                version = db.execute("SELECT value FROM app_settings WHERE key='startup_schema_version'").fetchone() if table else None
+                signature = db.execute("SELECT value FROM app_settings WHERE key='startup_schema_signature'").fetchone() if table else None
+                current = self._startup_schema_signature(db) if signature else None
+            if version and version["value"] == self.STARTUP_SCHEMA_VERSION and signature and signature["value"] == current:
+                return
+            self.initialize(admin_password)
+
     def initialize(self, admin_password):
         with self.connect() as db:
             db.executescript(SCHEMA)
@@ -416,6 +441,7 @@ class Database:
             if "retro_to" not in payroll_columns: db.execute("ALTER TABLE payroll_records ADD COLUMN retro_to TEXT")
             payroll_setting_columns={row["name"] for row in db.execute("PRAGMA table_info(payroll_settings)")}
             for column,default in (("transport_daily_exempt","450000"),("default_transport_days","26"),("schooling_annual_exempt","6000000"),("schooling_max_children","3"),
+                                   ("schooling_public_child","0"),("schooling_public_cap","0"),("schooling_private_child","0"),("schooling_private_cap","0"),
                                    ("tax_rounding","0"),("minimum_wage","0"),("max_children_deduction","5"),("family_allowance_spouse","0"),("family_allowance_child","0"),
                                    ("family_allowance_cap","0"),("family_allowance_max_children","5")):
                 if column not in payroll_setting_columns: db.execute(f"ALTER TABLE payroll_settings ADD COLUMN {column} TEXT NOT NULL DEFAULT '{default}'")
@@ -586,6 +612,11 @@ class Database:
             # indexes above.
             db.execute("ANALYZE")
         self._auto_lebanese_payroll_rules()
+        with self.connect() as db:
+            db.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES('startup_schema_version',?)",
+                       (self.STARTUP_SCHEMA_VERSION,))
+            db.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES('startup_schema_signature',?)",
+                       (self._startup_schema_signature(db),))
 
     def _auto_lebanese_payroll_rules(self):
         """If the Tax & NSSF settings were never filled in (all NSSF ceilings are 0), load the official Lebanese
@@ -2119,32 +2150,41 @@ class Database:
         return self.sync_historical_exchange_rates()
 
     def professional_dashboard(self):
-        invoice_rows=self.dashboard(); expenses=self.list_expenses()
+        """Aggregate dashboard figures in SQLite instead of loading every expense and invoice."""
         metrics={}
-        for row in invoice_rows:
-            code=row["currency"]; metrics.setdefault(code,{"currency":code,"sales":0.0,"purchases":0.0,"expenses":0.0,"profit":0.0,"receivables":0.0,"payables":0.0,"overdue":0})
-            amount=float(row["subtotal"] or 0)
-            if row["kind"]=="sale": metrics[code]["sales"]+=amount
-            else: metrics[code]["purchases"]+=amount
-        for row in expenses:
-            code=row["currency"]; metrics.setdefault(code,{"currency":code,"sales":0.0,"purchases":0.0,"expenses":0.0,"profit":0.0,"receivables":0.0,"payables":0.0,"overdue":0})
-            metrics[code]["expenses"]+=float(row["subtotal"] or 0)
-        today=datetime.now().date()
+        def metric(code):
+            return metrics.setdefault(code,{"currency":code,"sales":0.0,"purchases":0.0,
+                "expenses":0.0,"profit":0.0,"receivables":0.0,"payables":0.0,"overdue":0})
         with self.connect() as db:
-            invoices=[dict(row) for row in db.execute("SELECT kind,currency,total,amount_paid,due_date,status FROM invoices WHERE status NOT IN ('cancelled','deleted')")]
+            invoice_rows=db.execute("""SELECT kind,currency,
+                SUM(CAST(subtotal AS REAL)) subtotal,
+                SUM(CAST(total AS REAL)-CAST(COALESCE(amount_paid,'0') AS REAL)) outstanding
+                FROM invoices WHERE status NOT IN ('cancelled','deleted')
+                GROUP BY kind,currency""").fetchall()
+            expense_rows=db.execute("""SELECT currency,SUM(CAST(subtotal AS REAL)) subtotal
+                FROM expenses GROUP BY currency""").fetchall()
+            # Preserve the existing DD-MM-YYYY due date interpretation.
+            overdue_rows=db.execute("""SELECT currency,COUNT(*) overdue FROM invoices
+                WHERE status NOT IN ('cancelled','deleted')
+                  AND CAST(total AS REAL)>CAST(COALESCE(amount_paid,'0') AS REAL)
+                  AND due_date GLOB '??-??-????'
+                  AND substr(due_date,7,4)||'-'||substr(due_date,4,2)||'-'||substr(due_date,1,2)<?
+                GROUP BY currency""",(datetime.now().strftime("%Y-%m-%d"),)).fetchall()
             monthly=[dict(row) for row in db.execute("""SELECT substr(CASE WHEN invoice_date GLOB '??-??-????' THEN substr(invoice_date,7,4)||'-'||substr(invoice_date,4,2)||'-'||substr(invoice_date,1,2) ELSE invoice_date END,1,7) month,
                 currency,kind,SUM(CAST(subtotal AS REAL)) amount FROM invoices WHERE status NOT IN ('cancelled','deleted') GROUP BY month,currency,kind ORDER BY month""")]
-        for row in invoices:
-            code=row["currency"]; metrics.setdefault(code,{"currency":code,"sales":0.0,"purchases":0.0,"expenses":0.0,"profit":0.0,"receivables":0.0,"payables":0.0,"overdue":0})
-            outstanding=float(row["total"] or 0)-float(row["amount_paid"] or 0)
-            if row["kind"]=="sale": metrics[code]["receivables"]+=outstanding
-            else: metrics[code]["payables"]+=outstanding
-            if outstanding>0 and row.get("due_date"):
-                try:
-                    due=datetime.strptime(row["due_date"],"%d-%m-%Y").date()
-                    if due<today: metrics[code]["overdue"]+=1
-                except ValueError: pass
-        for value in metrics.values(): value["profit"]=value["sales"]-value["purchases"]-value["expenses"]
+        for row in invoice_rows:
+            values=metric(row["currency"]); amount=float(row["subtotal"] or 0)
+            outstanding=float(row["outstanding"] or 0)
+            if row["kind"]=="sale":
+                values["sales"]+=amount; values["receivables"]+=outstanding
+            else:
+                values["purchases"]+=amount; values["payables"]+=outstanding
+        for row in expense_rows:
+            metric(row["currency"])["expenses"]+=float(row["subtotal"] or 0)
+        for row in overdue_rows:
+            metric(row["currency"])["overdue"]=int(row["overdue"])
+        for values in metrics.values():
+            values["profit"]=values["sales"]-values["purchases"]-values["expenses"]
         return {"metrics":list(metrics.values()),"monthly":monthly}
 
     def _converted_amount(self, amount, source, target, rate_date):
@@ -2634,7 +2674,17 @@ class Database:
             row=db.execute("""SELECT * FROM payroll_settings WHERE date_from<=? AND (date_to IS NULL OR date_to='' OR date_to>=?)
                 ORDER BY date_from DESC LIMIT 1""",(target,target)).fetchone()
             if not row: row=db.execute("SELECT * FROM payroll_settings ORDER BY date_from DESC LIMIT 1").fetchone()
+            official_auto=db.execute("SELECT value FROM app_settings WHERE key='lebanese_payroll_rules_auto'").fetchone()
         result=dict(row) if row else {}
+        # Older auto-seeded company databases predate the schooling decree dates.
+        # Apply published values in memory, keeping saved user settings untouched.
+        schooling_keys=("schooling_public_child","schooling_public_cap","schooling_private_child","schooling_private_cap")
+        if result and official_auto and all(Decimal(str(result.get(key) or 0))==0 for key in schooling_keys):
+            import lebanese_payroll
+            effective=[period for period in lebanese_payroll.official_periods() if period["date_from"]<=target]
+            if effective:
+                result.update({key:effective[-1][key] for key in schooling_keys})
+                result["schooling_rules_date"]=effective[-1]["date_from"]
         if result:
             result["tax_brackets"]=json.loads(result["tax_brackets"])
             defaults=self.default_payroll_account_map()
@@ -2702,7 +2752,8 @@ class Database:
             for key in ("employee_account_map","manager_account_map"):
                 mapping={**self.default_payroll_account_map(),**(item.get(key) or {})}
                 db.execute(f"UPDATE payroll_settings SET {key}=? WHERE date_from=?",(json.dumps(mapping),date_from))
-            for key in ("transport_daily_exempt","default_transport_days","schooling_annual_exempt","schooling_max_children","tax_rounding","minimum_wage","max_children_deduction","family_allowance_spouse","family_allowance_child","family_allowance_cap","family_allowance_max_children"):
+            for key in ("transport_daily_exempt","default_transport_days","schooling_annual_exempt","schooling_max_children",
+                        "schooling_public_child","schooling_public_cap","schooling_private_child","schooling_private_cap","tax_rounding","minimum_wage","max_children_deduction","family_allowance_spouse","family_allowance_child","family_allowance_cap","family_allowance_max_children"):
                 if item.get(key) not in (None,""):
                     try: value=str(Decimal(str(item[key]).replace(",","")))
                     except Exception as exc: raise ValueError(f"{key.replace('_',' ').title()} must be a number") from exc
@@ -2761,7 +2812,23 @@ class Database:
             try: money[name]=D(str(raw).replace(",",""))
             except Exception as exc: raise ValueError(f"{name.replace('_',' ').title()} must be a number") from exc
             if money[name]<0: raise ValueError(f"{name.replace('_',' ').title()} cannot be negative")
+        # The selected date identifies a payroll month. Prorate a monthly base salary
+        # when the employee joined or left during that month; an edited salary is the actual amount.
+        month_start=rules_date[:8]+"01"
+        month_days=(datetime.strptime(rules_date,"%Y-%m-%d")-datetime.strptime(month_start,"%Y-%m-%d")).days+1
+        active_start=max(month_start,iso_date(employee["hire_date"]) if employee["hire_date"] else month_start)
+        active_end=min(rules_date,iso_date(employee["leave_date"]) if employee["leave_date"] else rules_date)
+        worked_days=max(0,(datetime.strptime(active_end,"%Y-%m-%d")-datetime.strptime(active_start,"%Y-%m-%d")).days+1)
+        if not worked_days: raise ValueError("Employee did not work in the selected payroll month")
+        work_fraction=D(worked_days)/D(month_days)
+        tax_days=max(0,(30 if active_end==rules_date else min(int(active_end[-2:]),30))-min(int(active_start[-2:]),30)+1)
+        tax_fraction=D(tax_days)/D(30)
+        base_salary=D(str(employee["base_salary"] or 0))
+        if worked_days<month_days and money["salary"]==base_salary:
+            money["salary"]=(base_salary*work_fraction).quantize(D("0.01"))
         currency=employee["currency"]; brackets=settings.get("tax_brackets",[]); notes=[]
+        if worked_days<month_days:
+            notes.append(f"Partial payroll: {worked_days}/{month_days} calendar days; base salary and tax bands/deductions prorated")
         to_lbp=lambda value,day=period: self._converted_amount(value,currency,"LBP",day)
         from_lbp=lambda value,day=period: self._converted_amount(value,"LBP",currency,day)
         try: days=int(D(str(item.get("transport_days") if item.get("transport_days") not in (None,"") else setting("default_transport_days","26"))))
@@ -2769,26 +2836,34 @@ class Database:
         if days<0 or days>31: raise ValueError("Transport days must be between 0 and 31")
         exempt_transport_lbp=min(to_lbp(money["transport"]),setting("transport_daily_exempt")*days)
         children=int(employee["children"] or 0)
-        schooling_limit=setting("schooling_annual_exempt")/12 if min(children,int(setting("schooling_max_children","3")))>0 else D("0")
-        exempt_schooling_lbp=min(to_lbp(money["schooling"]),schooling_limit)
+        schooling_limit=setting("schooling_annual_exempt") if min(children,int(setting("schooling_max_children","3")))>0 else D("0")
+        with self.connect() as db:
+            past_schooling=db.execute("""SELECT period_date,currency,exempt_schooling FROM payroll_records
+                WHERE employee_id=? AND period_date>=? AND period_date<?""",
+                (employee_id,period[:4]+"-01-01",month_start)).fetchall()
+        already_exempt=sum((self._converted_amount(D(str(row["exempt_schooling"] or 0)),row["currency"],"LBP",row["period_date"])
+                            for row in past_schooling),D("0"))
+        exempt_schooling_lbp=min(to_lbp(money["schooling"]),max(D("0"),schooling_limit-already_exempt))
         taxable_transport_lbp=to_lbp(money["transport"])-exempt_transport_lbp; taxable_schooling_lbp=to_lbp(money["schooling"])-exempt_schooling_lbp
         if taxable_transport_lbp>0: notes.append(f"Transport above the exempt {int(setting('transport_daily_exempt')):,} LBP x {days} days is taxed")
         if taxable_schooling_lbp>0: notes.append("Schooling above the exempt annual limit is taxed")
         allowance=setting("single_allowance")
         married=employee["marital_status"] in ("married","spouse"); spouse_works=married and bool(int(employee["spouse_works"] or 0))
-        family_deduction=D("0")
-        if married: family_deduction+=setting("spouse_allowance")
-        family_deduction+=setting("child_allowance")*min(children,int(setting("max_children_deduction","5")))
-        if spouse_works and family_deduction>0:
-            family_deduction=family_deduction/2
-            notes.append("Family tax deduction halved: married and the spouse also works, so the family deduction is split between the two spouses (confirm the split with your accountant)")
-        allowance+=family_deduction
+        # The personal deduction belongs to each employee. A spouse deduction applies
+        # only for a dependent spouse; when both parents work, split only the child deduction.
+        dependent_spouse_deduction=setting("spouse_allowance") if married and not spouse_works else D("0")
+        child_deduction=setting("child_allowance")*min(children,int(setting("max_children_deduction","5")))
+        if spouse_works and child_deduction:
+            child_deduction/=2
+            notes.append("Child tax deduction split equally because both spouses work")
+        allowance+=dependent_spouse_deduction+child_deduction
         if children>int(setting("max_children_deduction","5")): notes.append(f"Family deduction limited to {int(setting('max_children_deduction','5'))} children")
         regular_lbp=to_lbp(money["salary"]+money["overtime"]+money["commission"])+taxable_transport_lbp+taxable_schooling_lbp
         tax=lambda annual: self._progressive_tax(max(D("0"),annual-allowance),brackets)
-        regular_tax=tax(regular_lbp*12)/12
+        annual_regular=regular_lbp*12/tax_fraction
+        regular_tax=tax(annual_regular)*tax_fraction/12
         one_off_lbp=to_lbp(money["bonus"]+money["thirteenth_month"])
-        one_off_tax=tax(regular_lbp*12+one_off_lbp)-tax(regular_lbp*12)
+        one_off_tax=(tax(annual_regular+one_off_lbp/tax_fraction)-tax(annual_regular))*tax_fraction
         retro_tax=D("0"); retro_months=[]
         if money["retro_salary"]:
             start=iso_date(item.get("retro_from") or period,"Retro From"); end=iso_date(item.get("retro_to") or period,"Retro To")
@@ -2800,8 +2875,38 @@ class Database:
             share=money["retro_salary"]/len(retro_months)
             for month in retro_months:
                 month_settings=self.payroll_settings_for(month); month_brackets=month_settings.get("tax_brackets",brackets)
-                monthly=lambda annual: self._progressive_tax(max(D("0"),annual-allowance),month_brackets)/12
+                month_allowance=D(str(month_settings.get("single_allowance") or 0))
+                if married and not spouse_works:
+                    month_allowance+=D(str(month_settings.get("spouse_allowance") or 0))
+                month_children=min(children,int(month_settings.get("max_children_deduction") or 5))
+                month_child_allowance=D(str(month_settings.get("child_allowance") or 0))*month_children
+                month_allowance+=month_child_allowance/2 if spouse_works else month_child_allowance
+                monthly=lambda annual: self._progressive_tax(max(D("0"),annual-month_allowance),month_brackets)/12
                 retro_tax+=monthly((regular_lbp+to_lbp(share,month))*12)-monthly(regular_lbp*12)
+        # Salary tax withholding is cumulative across payrolls saved this year.
+        # Retros use the separate prior-period treatment above.
+        if not money["retro_salary"]:
+            with self.connect() as db:
+                previous=db.execute("""SELECT * FROM payroll_records
+                    WHERE employee_id=? AND period_date>=? AND period_date<? ORDER BY period_date""",
+                    (employee_id,period[:4]+"-01-01",month_start)).fetchall()
+            if previous:
+                prior_base=D("0"); prior_withheld=D("0")
+                for record in previous:
+                    gross=sum((D(str(record[key] or 0)) for key in
+                        ("salary","transport","overtime","commission","schooling","bonus","thirteenth_month")),D("0"))
+                    exempt=D(str(record["exempt_transport"] or 0))+D(str(record["exempt_schooling"] or 0))
+                    prior_base+=self._converted_amount(max(D("0"),gross-exempt),record["currency"],"LBP",record["period_date"])
+                    prior_withheld+=D(str(record["income_tax_lbp"] or 0))
+                elapsed=D(len(previous))+tax_fraction
+                bands=[[D(str(ceiling))*elapsed/12 if ceiling is not None else None,rate] for ceiling,rate in brackets]
+                def cumulative(base):
+                    return self._progressive_tax(max(D("0"),prior_base+base-allowance*elapsed/12),bands)
+                base_due=cumulative(regular_lbp)
+                full_due=cumulative(regular_lbp+one_off_lbp)
+                regular_tax=max(D("0"),base_due-prior_withheld)
+                one_off_tax=max(D("0"),full_due-base_due)
+                notes.append(f"Cumulative tax includes {len(previous)} earlier payroll(s) this year")
         rounding=setting("tax_rounding")
         def rounded(value):
             value=max(D("0"),value)
@@ -2810,7 +2915,7 @@ class Database:
         income_tax_lbp=rounded(regular_tax+one_off_tax+retro_tax)
         retro_tax_lbp=min(income_tax_lbp,max(D("0"),retro_tax).quantize(D("0.01")))
         income_tax=from_lbp(income_tax_lbp).quantize(D("0.01")); retro_tax_value=from_lbp(retro_tax_lbp).quantize(D("0.01"))
-        taxable_lbp=max(D("0"),regular_lbp*12-allowance)/12+one_off_lbp
+        taxable_lbp=max(D("0"),annual_regular-allowance)*tax_fraction/12+one_off_lbp
         # NSSF: salary, overtime, commission, bonus and 13th this month; retroactive salary in its own months.
         base_lbp=to_lbp(money["salary"]+money["overtime"]+money["commission"]+money["bonus"]+money["thirteenth_month"])
         def contribution(ceiling_name,rate_name,base,month_settings):
@@ -2866,8 +2971,10 @@ class Database:
             "employee_nssf_lbp":float(nssf["employee"][0]),"employer_medical":float(nssf["medical"][1]),"employer_end_service":float(nssf["end_service"][1]),
             "employer_family":float(nssf["family"][1]),"net_salary":float(net),"currency":currency,"retro_tax":float(retro_tax_value),"retro_tax_lbp":float(retro_tax_lbp),
             "regular_tax":float(from_lbp(rounded(regular_tax)).quantize(D("0.01"))),"one_off_tax":float(from_lbp(max(D("0"),one_off_tax)).quantize(D("0.01"))),
-            "transport_days":days,"exempt_transport":float(from_lbp(exempt_transport_lbp).quantize(D("0.01"))),"exempt_schooling":float(from_lbp(exempt_schooling_lbp).quantize(D("0.01"))),
-            "family_allowance":float(family_allowance),"compliance_notes":notes,"period_date":period,
+            "worked_days":worked_days,"calendar_days":month_days,"transport_days":days,"exempt_transport":float(from_lbp(exempt_transport_lbp).quantize(D("0.01"))),"exempt_schooling":float(from_lbp(exempt_schooling_lbp).quantize(D("0.01"))),
+            "family_allowance":float(family_allowance),"family_deduction_lbp":float(allowance),
+            "annualized_recurring_lbp":float(annual_regular),"annualized_taxable_lbp":float(max(D("0"),annual_regular-allowance)),
+            "compliance_notes":notes,"period_date":period,
             "settings_period":{"date_from":settings.get("date_from"),"date_to":settings.get("date_to")},"rules_date":rules_date,
             "ceilings":{"medical":float(D(str(settings.get("medical_ceiling") or 0))),"family":float(D(str(settings.get("family_ceiling") or 0)))}}
 

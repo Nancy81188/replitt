@@ -345,3 +345,8 @@ class ApiClient:
     def bank_lines(self,account,currency,date_from,date_to,balance=None):
         return self.request("GET","/api/bank/lines?"+urlencode({k:v for k,v in {"account":account,"currency":currency,"from":date_from,"to":date_to,"balance":balance}.items() if v not in (None,"")}))
     def bank_action(self,action,item): return self.request("POST",f"/api/bank/{action}",item)
+    def asset_categories(self): return self.request("GET","/api/asset-categories")["items"]
+    def save_asset_category(self,item): return self.request("POST","/api/asset-categories",item)["items"]
+    def asset_depreciation(self,month,account=None): return self.request("GET","/api/asset-depreciation?"+urlencode({k:v for k,v in {"month":month,"account":account}.items() if v}))
+    def post_asset_depreciation(self,account_code,month): return self.request("POST","/api/asset-depreciation/post",{"account_code":account_code,"month":month})
+

@@ -183,3 +183,93 @@ def carry_forward(source, target, target_year):
                 if row["posted"] and row["period_end"][:4]<str(target_year):
                     db.execute("INSERT INTO fixed_asset_postings(asset_id,period_end,amount,entry_id) VALUES(?,?,?,NULL)",
                                (new_id,row["period_end"],row["amount"]))
+
+
+# ---------------------------------------------------------------- asset accounts (categories) with depreciation %
+def _migrate_categories(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS asset_categories (account_code TEXT PRIMARY KEY, name TEXT NOT NULL, annual_rate TEXT NOT NULL,
+        depreciation_account TEXT NOT NULL, accumulated_account TEXT NOT NULL, updated_at TEXT)""")
+
+
+def list_categories(database):
+    with database.connect() as db:
+        _migrate_categories(db)
+        return [dict(r) for r in db.execute("SELECT * FROM asset_categories ORDER BY account_code")]
+
+
+def save_category(database, payload, user_id=None):
+    code = str(payload.get("account_code") or "").split(" - ", 1)[0].strip(); name = str(payload.get("name") or "").strip()
+    if not code or not name: raise ValueError("Enter the asset account number and its name")
+    rate = _money(payload.get("annual_rate"), "Depreciation %")
+    if rate <= 0 or rate > 100: raise ValueError("The depreciation % must be between 0 and 100 per year")
+    dep = str(payload.get("depreciation_account") or "").split(" - ", 1)[0].strip(); acc = str(payload.get("accumulated_account") or "").split(" - ", 1)[0].strip()
+    if not dep or not acc: raise ValueError("Enter the depreciation expense account and the accumulated depreciation account")
+    with database.connect() as db:
+        _migrate_categories(db)
+        for label, value in (("Asset account", code), ("Depreciation expense account", dep), ("Accumulated depreciation account", acc)):
+            if not db.execute("SELECT 1 FROM accounts WHERE code=?", (value,)).fetchone(): raise ValueError(f"{label} {value} is not in the chart of accounts")
+        db.execute("""INSERT INTO asset_categories(account_code,name,annual_rate,depreciation_account,accumulated_account,updated_at) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(account_code) DO UPDATE SET name=excluded.name,annual_rate=excluded.annual_rate,depreciation_account=excluded.depreciation_account,
+            accumulated_account=excluded.accumulated_account,updated_at=excluded.updated_at""", (code, name, str(rate), dep, acc, datetime.now().isoformat()))
+    return list_categories(database)
+
+
+def delete_category(database, account_code):
+    with database.connect() as db:
+        _migrate_categories(db)
+        if db.execute("SELECT 1 FROM fixed_assets WHERE asset_account=? AND status='active'", (account_code,)).fetchone():
+            raise ValueError("Assets still use this account; move or delete them first")
+        db.execute("DELETE FROM asset_categories WHERE account_code=?", (account_code,))
+    return list_categories(database)
+
+
+def _month_end(value):
+    day = date.fromisoformat(_iso(value)); return date(day.year, day.month, calendar.monthrange(day.year, day.month)[1]).isoformat()
+
+
+def monthly_table(database, month, account_code=None):
+    """Depreciation table of one month: for every asset, grouped by asset account - purchase date, value, depreciation before
+    the month, depreciation of the month, total depreciation and net value (never below zero / the residual value)."""
+    end = _month_end(month); categories = {c["account_code"]: c for c in list_categories(database)}
+    groups = {}
+    for asset in list_assets(database):
+        if asset.get("status", "active") != "active" or asset["acquired_on"] > end: continue
+        if account_code and asset["asset_account"] != account_code: continue
+        rows = schedule(database, asset["id"]); cost = Decimal(str(asset["cost"])); residual = Decimal(str(asset.get("residual") or 0))
+        before = sum((Decimal(r["amount"]) for r in rows if r["period_end"] < end), Decimal("0"))
+        current_row = next((r for r in rows if r["period_end"] == end), None); current = Decimal(current_row["amount"]) if current_row else Decimal("0")
+        before = min(before, cost - residual); current = max(Decimal("0"), min(current, cost - residual - before))  # net value never below the residual / zero
+        total = before + current
+        group = groups.setdefault(asset["asset_account"], {"account": asset["asset_account"], "name": categories.get(asset["asset_account"], {}).get("name", ""),
+                                                           "rate": categories.get(asset["asset_account"], {}).get("annual_rate", asset.get("annual_rate") or ""),
+                                                           "depreciation_account": asset["depreciation_account"], "accumulated_account": asset["accumulated_account"],
+                                                           "currency": asset["currency"], "assets": []})
+        group["assets"].append({"id": asset["id"], "code": asset["asset_code"], "name": asset["name"], "acquired_on": asset["acquired_on"], "value": cost,
+                                "old": before, "current": current, "total": total, "net": cost - total, "posted": bool(current_row and current_row["posted"]), "currency": asset["currency"]})
+    for group in groups.values():
+        for key in ("value", "old", "current", "total", "net"): group[key] = sum((a[key] for a in group["assets"]), Decimal("0"))
+        group["to_post"] = sum((a["current"] for a in group["assets"] if not a["posted"]), Decimal("0"))
+    return {"month": end, "groups": [groups[k] for k in sorted(groups)]}
+
+
+def post_category_month(database, account_code, month, user_id, fiscal_year=None):
+    """One depreciation entry per asset account for the month: Dr depreciation expense / Cr accumulated depreciation."""
+    table = monthly_table(database, month, account_code)
+    if not table["groups"]: raise ValueError("No asset in this account for this month")
+    group = table["groups"][0]; end = table["month"]
+    if fiscal_year is not None and int(end[:4]) != int(fiscal_year): raise ValueError(f"Select fiscal year {end[:4]} before posting this depreciation")
+    pending = [a for a in group["assets"] if not a["posted"] and a["current"] > 0]
+    if not pending: raise ValueError("The depreciation of this account for this month is already posted (or is zero)")
+    late = []
+    for asset in pending:
+        earlier = [r for r in schedule(database, asset["id"]) if r["period_end"] < end and not r["posted"] and Decimal(r["amount"]) > 0]
+        if earlier: late.append(asset["code"])
+    if late: raise ValueError("Post the earlier months first for: " + ", ".join(late))
+    amount = sum((a["current"] for a in pending), Decimal("0"))
+    voucher = database.save_journal_voucher({"entry_date": datetime.strptime(end, "%Y-%m-%d").strftime("%d-%m-%Y"),
+        "description": f"Depreciation {group['name'] or account_code} ({account_code}) - {end[:7]}", "currency": group["currency"], "voucher_type": "06"},
+        [{"account_code": group["depreciation_account"], "debit": str(amount)}, {"account_code": group["accumulated_account"], "credit": str(amount)}], user_id)
+    with database.connect() as db:
+        for asset in pending:
+            db.execute("INSERT OR IGNORE INTO fixed_asset_postings(asset_id,period_end,amount,entry_id) VALUES(?,?,?,?)", (asset["id"], end, str(asset["current"]), voucher["voucher"]["id"]))
+    return {"voucher": voucher["voucher"]["entry_number"], "amount": float(amount), "assets": len(pending)}
