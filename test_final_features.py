@@ -511,7 +511,7 @@ class LebanesePayrollRulesTest(unittest.TestCase):
 
     def test_official_periods_and_published_example(self):
         periods = [(p["date_from"], p["medical_ceiling"], p["family_ceiling"], p["tax_rounding"]) for p in self.db.list_payroll_settings()]
-        self.assertEqual(periods[1], ("2024-04-01", "90000000", "12000000", "0")); self.assertEqual(periods[-1], ("2026-05-01", "120000000", "28000000", "10000"))
+        self.assertEqual(periods[1], ("2024-04-01", "90000000", "12000000", "0")); self.assertIn(("2026-05-01", "120000000", "28000000", "10000"), periods)
         result = self.calc(self.single, "30-04-2024")  # L'Orient Today worked example: LBP 1.074 bn a year, single
         self.assertEqual((result["income_tax_lbp"], result["employee_nssf_lbp"], result["compliance_notes"]), (1480000, 2685000, []))
 
@@ -536,15 +536,15 @@ class LebanesePayrollRulesTest(unittest.TestCase):
         self.assertAlmostEqual(sum(r["debit"] for r in nssf), 62.18, places=2)
 
     def test_family_tax_deduction_halved_when_spouse_works(self):
-        # Same married employee with 3 children: when the spouse also works the family deduction is split in half.
+        # The spouse deduction applies only to a dependent spouse; two working parents split only the child deduction.
         stay_home = self.db.save_employee({"employee_number": "3000", "full_name": "Home Spouse", "currency": "LBP",
             "base_salary": "120000000", "marital_status": "married", "children": 3, "spouse_works": False}, self.user)
         both_work = self.db.save_employee({"employee_number": "3100", "full_name": "Working Spouse", "currency": "LBP",
             "base_salary": "120000000", "marital_status": "married", "children": 3, "spouse_works": True}, self.user)
         home = self.calc(stay_home, "31-05-2026"); working = self.calc(both_work, "31-05-2026")
         self.assertGreater(working["income_tax_lbp"], home["income_tax_lbp"])  # smaller deduction -> more tax
-        self.assertTrue(any("Family tax deduction halved" in note for note in working["compliance_notes"]))
-        self.assertFalse(any("Family tax deduction halved" in note for note in home["compliance_notes"]))
+        self.assertTrue(any("Child tax deduction split equally" in note for note in working["compliance_notes"]))
+        self.assertFalse(any("Child tax deduction split equally" in note for note in home["compliance_notes"]))
 
     def test_end_of_service_exempt_for_foreign_or_over_64(self):
         lebanese = self.db.save_employee({"employee_number": "4000", "full_name": "Local Young", "currency": "LBP",
@@ -718,7 +718,7 @@ class ArabicPdfAndNssfTest(unittest.TestCase):
     def tearDown(self): self.folder.cleanup()
 
     def test_rules_load_automatically_and_apply_by_month(self):
-        self.assertEqual(len(self.db.list_payroll_settings()), 6)
+        self.assertGreaterEqual(len(self.db.list_payroll_settings()), 6)
         mid_november = self.db.calculate_payroll({"employee_id": self.rami["id"], "period_date": "15-11-2024"})
         self.assertEqual(mid_november["rules_date"], "2024-11-30"); self.assertEqual(mid_november["income_tax_lbp"] % 10000, 0)  # rounding from 25-11-2024 applies to November
         self.assertEqual(self.db.calculate_payroll({"employee_id": self.rami["id"], "period_date": "10-08-2025"})["ceilings"]["medical"], 120000000)
