@@ -79,14 +79,18 @@ class PDFFormEditorSaveTests(unittest.TestCase):
 
 
 class PDFFormEditorIntegrationTests(unittest.TestCase):
-    def test_official_payroll_form_opens_in_editor_without_overwriting_source(self):
-        editor = types.SimpleNamespace()
-        with patch("desktop.urlopen", return_value=io.BytesIO(b"%PDF-1.4\nsample")), \
-             patch("pdf_form_editor.open_pdf_form_editor", return_value=editor) as open_editor:
-            SaberApp.download_payroll_form(types.SimpleNamespace(), "R3")
-        self.assertTrue(open_editor.called)
-        self.assertEqual(open_editor.call_args.args[1].read_bytes(), b"%PDF-1.4\nsample")
-        editor._owned_tempdir.cleanup()
+    def test_legacy_payroll_form_shortcut_opens_cnss_form_for_selected_employee(self):
+        open_cnss_form = Mock()
+        employee_tree = Mock()
+        employee_tree.selection.return_value = ("employee-17",)
+        app = types.SimpleNamespace(
+            employee_tree=employee_tree,
+            open_cnss_form=open_cnss_form,
+        )
+
+        SaberApp.download_payroll_form(app, "R3")
+
+        open_cnss_form.assert_called_once_with("R3", "employee-17")
 
     def test_generated_report_opens_in_editor_with_exported_pdf(self):
         editor = types.SimpleNamespace()
